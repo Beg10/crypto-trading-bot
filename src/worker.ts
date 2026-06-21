@@ -1,8 +1,8 @@
 /**
  * Background worker — runs independently of the Telegram bot process.
  * Every WORKER_INTERVAL_MINUTES it:
- *   1. Fetches candles for all watched symbols
- *   2. Runs technical analysis → sends GEH REIN alert when signals align
+ *   1. Fetches candles for all watched symbols + channel symbols
+ *   2. Runs technical analysis → sends GEH REIN to users + channel
  *   3. Checks active trades → sends GEH RAUS when SL or TP is hit
  *   4. Refreshes the news cache
  */
@@ -27,6 +27,12 @@ if (!process.env.BOT_TOKEN) {
 const bot = new Bot(process.env.BOT_TOKEN);
 const INTERVAL_MS = (parseInt(process.env.WORKER_INTERVAL_MINUTES ?? '5', 10)) * 60 * 1000;
 
+// ─── Channel config ───────────────────────────────────────────────────────────
+// Set CHANNEL_ID env var to your channel username or numeric ID
+const CHANNEL_ID: string | null = process.env.CHANNEL_ID ?? null;
+// Symbols always broadcast to channel (independent of user watchlists)
+const CHANNEL_SYMBOLS = ['ETHUSDT', 'SOLUSDT', 'BNBUSDT'];
+
 // ─── Signal deduplication ─────────────────────────────────────────────────────
 const lastAlertTime = new Map<string, number>();
 const ALERT_COOLDOWN_MS = 60 * 60 * 1000; // 1 hour per symbol
@@ -34,15 +40,16 @@ const ALERT_COOLDOWN_MS = 60 * 60 * 1000; // 1 hour per symbol
 // ─── Active trade tracking ────────────────────────────────────────────────────
 
 interface ActiveTrade {
-  symbol:    string;
-  direction: 'bullish' | 'bearish';
-  entry:     number;
-  sl:        number;
-  tp1:       number;
-  tp2:       number;
-  users:     Array<{ telegram_id: number; capital: number | null }>;
-  openTime:  number;
-  tp1Hit:    boolean;
+  symbol:        string;
+  direction:     'bullish' | 'bearish';
+  entry:         number;
+  sl:            number;
+  tp1:           number;
+  tp2:           number;
+  users:         Array<{ telegram_id: number; capital: number | null }>;
+  openTime:      number;
+  tp1Hit:        boolean;
+  postToChannel: boolean; // whether to also send exit messages to channel
 }
 
 const activeTrades = new Map<string, ActiveTrade>();
@@ -58,6 +65,17 @@ function fmt(n: number): string {
 function pct(from: number, to: number): string {
   const p = ((to - from) / from) * 100;
   return (p >= 0 ? '+' : '') + p.toFixed(2) + '%';
+}
+
+// ─── Channel helper ───────────────────────────────────────────────────────────
+
+async function sendToChannel(message: string): Promise<void> {
+  if (!CHANNEL_ID) return;
+  try {
+    await bot.api.sendMessage(CHANNEL_ID, message, { parse_mode: 'Markdown' });
+  } catch (e) {
+    console.error('[worker] Channel send failed:', (e as Error).message);
+  }
 }
 
 // ─── Message builders ─────────────────────────────────────────────────────────
@@ -138,7 +156,7 @@ function buildExitMessage(trade: ActiveTrade, reason: 'sl' | 'tp1' | 'tp2', curr
   );
 }
 
-// ─── Send to all users of a trade ────────────────────────────────────────────
+// ─── Send helpers ─────────────────────────────────────────────────────────────
 
 async function sendToTradeUsers(trade: ActiveTrade, message: string): Promise<void> {
   for (const { telegram_id } of trade.users) {
@@ -147,6 +165,9 @@ async function sendToTradeUsers(trade: ActiveTrade, message: string): Promise<vo
     } catch (e) {
       console.error(`[worker] sendMessage to ${telegram_id} failed:`, (e as Error).message);
     }
+  }
+  if (trade.postToChannel) {
+    await sendToChannel(message);
   }
 }
 
@@ -162,38 +183,38 @@ async function checkActiveTrade(
 
   if (direction === 'bullish') {
     if (high >= tp2) {
-      console.log(`[worker] ${symbol} TP2 hit (bullish)`);
+      console.log(`[worker] ${symbol} TP2 hit`);
       await sendToTradeUsers(trade, buildExitMessage(trade, 'tp2', close));
       activeTrades.delete(symbol);
       return;
     }
     if (!trade.tp1Hit && high >= tp1) {
-      console.log(`[worker] ${symbol} TP1 hit (bullish)`);
+      console.log(`[worker] ${symbol} TP1 hit`);
       await sendToTradeUsers(trade, buildExitMessage(trade, 'tp1', close));
       trade.tp1Hit = true;
       return;
     }
     if (low <= sl) {
-      console.log(`[worker] ${symbol} SL hit (bullish)`);
+      console.log(`[worker] ${symbol} SL hit`);
       await sendToTradeUsers(trade, buildExitMessage(trade, 'sl', close));
       activeTrades.delete(symbol);
       return;
     }
   } else {
     if (low <= tp2) {
-      console.log(`[worker] ${symbol} TP2 hit (bearish)`);
+      console.log(`[worker] ${symbol} TP2 hit`);
       await sendToTradeUsers(trade, buildExitMessage(trade, 'tp2', close));
       activeTrades.delete(symbol);
       return;
     }
     if (!trade.tp1Hit && low <= tp1) {
-      console.log(`[worker] ${symbol} TP1 hit (bearish)`);
+      console.log(`[worker] ${symbol} TP1 hit`);
       await sendToTradeUsers(trade, buildExitMessage(trade, 'tp1', close));
       trade.tp1Hit = true;
       return;
     }
     if (high >= sl) {
-      console.log(`[worker] ${symbol} SL hit (bearish)`);
+      console.log(`[worker] ${symbol} SL hit`);
       await sendToTradeUsers(trade, buildExitMessage(trade, 'sl', close));
       activeTrades.delete(symbol);
       return;
@@ -207,24 +228,38 @@ async function runAnalysis(): Promise<void> {
   console.log('[worker] Running analysis tick…');
 
   const watched = await getAllWatchedSymbols();
-  if (watched.length === 0) {
-    console.log('[worker] No symbols watched — skipping analysis.');
+
+  // Merge user watchlist with channel symbols (deduplicated)
+  const symbolMap = new Map<string, string[]>();
+  for (const { symbol, user_ids } of watched) {
+    symbolMap.set(symbol, user_ids);
+  }
+  // Channel symbols always analyzed even if no user watches them
+  if (CHANNEL_ID) {
+    for (const sym of CHANNEL_SYMBOLS) {
+      if (!symbolMap.has(sym)) symbolMap.set(sym, []);
+    }
+  }
+
+  if (symbolMap.size === 0) {
+    console.log('[worker] No symbols to analyze — skipping.');
     return;
   }
 
-  for (const { symbol, user_ids } of watched) {
+  for (const [symbol, user_ids] of symbolMap) {
     try {
       const candles = await getCandles(symbol, '4h', 100);
+      const isChannelSymbol = CHANNEL_ID !== null && CHANNEL_SYMBOLS.includes(symbol);
 
-      // 1. Check active trade for this symbol
+      // 1. Check active trade
       const activeTrade = activeTrades.get(symbol);
       if (activeTrade) {
         await checkActiveTrade(activeTrade, candles);
       }
 
-      // 2. Look for new entry signal (skip if trade already active)
       if (activeTrades.has(symbol)) continue;
 
+      // 2. Look for new signal
       const result: AnalysisResult = analyzeCandles(symbol, candles);
       if (!isNotifiableSignal(result)) continue;
 
@@ -236,33 +271,40 @@ async function runAnalysis(): Promise<void> {
 
       lastAlertTime.set(symbol, Date.now());
 
-      const users = await getUsersForAlert(user_ids);
+      const users = user_ids.length > 0 ? await getUsersForAlert(user_ids) : [];
 
+      // Register active trade
       if (result.entry !== null && result.stopLoss !== null && result.takeProfit1 !== null && result.takeProfit2 !== null && result.direction !== null) {
         activeTrades.set(symbol, {
           symbol,
-          direction: result.direction,
-          entry:     result.entry,
-          sl:        result.stopLoss,
-          tp1:       result.takeProfit1,
-          tp2:       result.takeProfit2,
+          direction:     result.direction,
+          entry:         result.entry,
+          sl:            result.stopLoss,
+          tp1:           result.takeProfit1,
+          tp2:           result.takeProfit2,
           users,
-          openTime:  Date.now(),
-          tp1Hit:    false,
+          openTime:      Date.now(),
+          tp1Hit:        false,
+          postToChannel: isChannelSymbol,
         });
         console.log(`[worker] Active trade opened: ${symbol} ${result.direction}`);
       }
 
+      // Send to individual users
       for (const { telegram_id, capital } of users) {
         try {
-          const message = buildEntryMessage(result, capital);
-          await bot.api.sendMessage(telegram_id, message, { parse_mode: 'Markdown' });
+          await bot.api.sendMessage(telegram_id, buildEntryMessage(result, capital), { parse_mode: 'Markdown' });
         } catch (e) {
           console.error(`[worker] sendMessage to ${telegram_id} failed:`, (e as Error).message);
         }
       }
 
-      console.log(`[worker] Entry alert sent for ${symbol} to ${users.length} user(s)`);
+      // Send to channel (no position sizing)
+      if (isChannelSymbol) {
+        await sendToChannel(buildEntryMessage(result, null));
+      }
+
+      console.log(`[worker] Alert sent for ${symbol} — users: ${users.length}, channel: ${isChannelSymbol}`);
     } catch (e) {
       console.error(`[worker] Analysis failed for ${symbol}:`, (e as Error).message);
     }
@@ -313,6 +355,7 @@ async function notifyAdmin(message: string): Promise<void> {
 
 async function main(): Promise<void> {
   console.log(`[worker] Starting — interval: ${INTERVAL_MS / 60000} min`);
+  if (CHANNEL_ID) console.log(`[worker] Channel broadcasting active: ${CHANNEL_ID}`);
   await notifyAdmin(`⚙️ *Worker gestartet!*\nAnalyse-Intervall: ${INTERVAL_MS / 60000} min\n_${new Date().toISOString()}_`);
   setInterval(tick, INTERVAL_MS);
   await tick();
