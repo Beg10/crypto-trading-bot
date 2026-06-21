@@ -62,6 +62,9 @@ export interface AnalysisResult {
   riskReward: number | null;
   ema50: number | null;
   volumeRatio: number | null;
+  stochRsiK: number | null;
+  stochRsiD: number | null;
+  divergence: 'bullish' | 'bearish' | null;
 }
 
 export interface CoinMarketData {
