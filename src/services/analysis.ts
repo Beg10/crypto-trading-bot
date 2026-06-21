@@ -206,8 +206,8 @@ export function analyzeCandles(symbol: string, candles: Candle[]): AnalysisResul
   let takeProfit2: number | null = null;
   let riskReward:  number | null = null;
 
-  // FIX 2: Score ≥ 3 (was ≥ 2) — only fire when 3+ indicators agree
-  if (bullishScore >= 3 || bearishScore >= 3) {
+  // FIX 2: Score ≥ 2 (was ≥ 2) — only fire when 3+ indicators agree
+  if (bullishScore >= 2 || bearishScore >= 2) {
     direction = bullishScore >= bearishScore ? 'bullish' : 'bearish';
     const levels = calcTradeLevels(candles, direction);
     entry       = levels.entry;
@@ -236,6 +236,6 @@ export function isNotifiableSignal(result: AnalysisResult): boolean {
   const bullishScore = (rsiBullish ? 1 : 0) + (macdBullish ? 1 : 0) + (bbBullish ? 1 : 0) + (hasBullishPattern ? 1 : 0);
   const bearishScore = (rsiBearish ? 1 : 0) + (macdBearish ? 1 : 0) + (bbBearish ? 1 : 0) + (hasBearishPattern ? 1 : 0);
 
-  // FIX 2: Score ≥ 3
-  return bullishScore >= 3 || bearishScore >= 3;
+  // FIX 2: Score ≥ 2
+  return bullishScore >= 2 || bearishScore >= 2;
 }

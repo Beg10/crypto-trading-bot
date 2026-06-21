@@ -42,7 +42,7 @@ interface ActiveTrade {
   tp2:       number;
   users:     Array<{ telegram_id: number; capital: number | null }>;
   openTime:  number;
-  tp1Hit:    boolean; // true after TP1 notified — we still watch for TP2
+  tp1Hit:    boolean;
 }
 
 const activeTrades = new Map<string, ActiveTrade>();
@@ -63,7 +63,9 @@ function pct(from: number, to: number): string {
 // ─── Message builders ─────────────────────────────────────────────────────────
 
 function buildEntryMessage(result: AnalysisResult, capital: number | null = null): string {
-  const dir = result.direction === 'bullish' ? '🟢 GEH REIN' : '🔴 GEH RAUS — SHORT';
+  const dir = result.direction === 'bullish'
+    ? '🟢 GEH REIN'
+    : '⚠️ FINGER WEG — Preis könnte fallen';
   const allSignals = result.signals.map((s) => `  • ${s}`).join('\n');
 
   let tradeLevels = '';
@@ -86,9 +88,9 @@ function buildEntryMessage(result: AnalysisResult, capital: number | null = null
     if (capital !== null && capital > 0 && result.entry > 0) {
       const slDistance = Math.abs(result.entry - result.stopLoss) / result.entry;
       if (slDistance > 0) {
-        const riskAmount   = capital * 0.02;
-        const rawPosition  = riskAmount / slDistance;
-        const position     = Math.min(rawPosition, capital);
+        const riskAmount  = capital * 0.02;
+        const rawPosition = riskAmount / slDistance;
+        const position    = Math.min(rawPosition, capital);
         positionLine = `💼 *Position:* $${fmt(position)} _(2% Risiko)_\n`;
       }
     }
@@ -127,7 +129,6 @@ function buildExitMessage(trade: ActiveTrade, reason: 'sl' | 'tp1' | 'tp2', curr
       `_Tipp: Nimm die Hälfte raus, Rest läuft auf TP2 ($${fmt(trade.tp2)})_`
     );
   }
-  // tp2
   return (
     `🏆 *GEH RAUS (alles) — ${trade.symbol}*\n\n` +
     `✅ TP2 erreicht — voller Gewinn!\n` +
@@ -160,27 +161,18 @@ async function checkActiveTrade(
   const { direction, sl, tp1, tp2, symbol } = trade;
 
   if (direction === 'bullish') {
-    // Check TP2 first (best outcome)
-    if (!trade.tp1Hit && high >= tp2) {
+    if (high >= tp2) {
       console.log(`[worker] ${symbol} TP2 hit (bullish)`);
       await sendToTradeUsers(trade, buildExitMessage(trade, 'tp2', close));
       activeTrades.delete(symbol);
       return;
     }
-    if (high >= tp2 && trade.tp1Hit) {
-      console.log(`[worker] ${symbol} TP2 hit (bullish, after TP1)`);
-      await sendToTradeUsers(trade, buildExitMessage(trade, 'tp2', close));
-      activeTrades.delete(symbol);
-      return;
-    }
-    // TP1 hit — notify, keep watching for TP2
     if (!trade.tp1Hit && high >= tp1) {
       console.log(`[worker] ${symbol} TP1 hit (bullish)`);
       await sendToTradeUsers(trade, buildExitMessage(trade, 'tp1', close));
       trade.tp1Hit = true;
       return;
     }
-    // Stop loss
     if (low <= sl) {
       console.log(`[worker] ${symbol} SL hit (bullish)`);
       await sendToTradeUsers(trade, buildExitMessage(trade, 'sl', close));
@@ -188,7 +180,6 @@ async function checkActiveTrade(
       return;
     }
   } else {
-    // bearish
     if (low <= tp2) {
       console.log(`[worker] ${symbol} TP2 hit (bearish)`);
       await sendToTradeUsers(trade, buildExitMessage(trade, 'tp2', close));
@@ -247,7 +238,6 @@ async function runAnalysis(): Promise<void> {
 
       const users = await getUsersForAlert(user_ids);
 
-      // Register active trade
       if (result.entry !== null && result.stopLoss !== null && result.takeProfit1 !== null && result.takeProfit2 !== null && result.direction !== null) {
         activeTrades.set(symbol, {
           symbol,
@@ -263,7 +253,6 @@ async function runAnalysis(): Promise<void> {
         console.log(`[worker] Active trade opened: ${symbol} ${result.direction}`);
       }
 
-      // Send GEH REIN to each user
       for (const { telegram_id, capital } of users) {
         try {
           const message = buildEntryMessage(result, capital);
