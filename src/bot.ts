@@ -49,4 +49,39 @@ bot.on('message:text', async (ctx) => {
   }
 });
 
-// ─── Error handling ─────────────────────────────────────────────────�
+// ─── Error handling ───────────────────────────────────────────────────────────
+
+bot.catch((err) => {
+  const ctx = err.ctx;
+  console.error(`Error handling update ${ctx.update.update_id}:`);
+
+  if (err.error instanceof GrammyError) {
+    console.error('grammY error:', err.error.description);
+  } else if (err.error instanceof HttpError) {
+    console.error('HTTP error:', err.error);
+  } else {
+    console.error('Unknown error:', err.error);
+  }
+});
+
+// ─── Crash monitoring ─────────────────────────────────────────────────────────
+
+process.on('uncaughtException', async (err) => {
+  console.error('[bot] Uncaught exception:', err);
+  await notifyAdmin(`🔴 *Bot crashed!*\n\`${err.message}\`\n\nRailway wird neu starten…`);
+  process.exit(1);
+});
+
+process.on('unhandledRejection', async (reason) => {
+  console.error('[bot] Unhandled rejection:', reason);
+  await notifyAdmin(`🔴 *Bot unhandled rejection!*\n\`${String(reason)}\`\n\nRailway wird neu starten…`);
+});
+
+// ─── Start ─────────────────────────────────────────────────────────────────────
+
+bot.start({
+  onStart: async (info) => {
+    console.log(`Bot started as @${info.username}`);
+    await notifyAdmin(`🟢 *Bot gestartet!*\n@${info.username} ist online.\n_${new Date().toISOString()}_`);
+  },
+});
