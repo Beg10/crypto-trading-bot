@@ -5,7 +5,7 @@
  * Every WORKER_INTERVAL_MINUTES it:
  *   1. Fetches candles for all watched symbols
  *   2. Runs technical analysis
- *   3. Pushes Telegram alerts when signals align
+ *   3. Pushes Telegram alerts when signals align (personalized with position sizing)
  *   4. Refreshes the news cache (CryptoPanic + NewsAPI/Claude)
  */
 
@@ -13,7 +13,7 @@ import 'dotenv/config';
 import { Bot } from 'grammy';
 import {
   getAllWatchedSymbols,
-  getTelegramIdsByUserIds,
+  getUsersForAlert,
   upsertNewsItems,
 } from './db';
 import { getCandles } from './services/binance';
@@ -59,18 +59,18 @@ async function runAnalysis(): Promise<void> {
 
       lastAlertTime.set(symbol, Date.now());
 
-      const telegramIds = await getTelegramIdsByUserIds(user_ids);
-      const message = buildAlertMessage(result);
+      const users = await getUsersForAlert(user_ids);
 
-      for (const telegramId of telegramIds) {
+      for (const { telegram_id, capital } of users) {
         try {
-          await bot.api.sendMessage(telegramId, message, { parse_mode: 'Markdown' });
+          const message = buildAlertMessage(result, capital);
+          await bot.api.sendMessage(telegram_id, message, { parse_mode: 'Markdown' });
         } catch (e) {
-          console.error(`[worker] sendMessage to ${telegramId} failed:`, (e as Error).message);
+          console.error(`[worker] sendMessage to ${telegram_id} failed:`, (e as Error).message);
         }
       }
 
-      console.log(`[worker] Alert sent for ${symbol} to ${telegramIds.length} user(s)`);
+      console.log(`[worker] Alert sent for ${symbol} to ${users.length} user(s)`);
     } catch (e) {
       console.error(`[worker] Analysis failed for ${symbol}:`, (e as Error).message);
     }
@@ -89,11 +89,13 @@ function pct(from: number, to: number): string {
   return (p >= 0 ? '+' : '') + p.toFixed(2) + '%';
 }
 
-function buildAlertMessage(result: AnalysisResult): string {
+function buildAlertMessage(result: AnalysisResult, capital: number | null = null): string {
   const dir = result.direction === 'bullish' ? '🟢 BULLISH' : '🔴 BEARISH';
   const allSignals = result.signals.map((s) => `  • ${s}`).join('\n');
 
   let tradeLevels = '';
+  let positionLine = '';
+
   if (
     result.entry !== null &&
     result.stopLoss !== null &&
@@ -107,6 +109,17 @@ function buildAlertMessage(result: AnalysisResult): string {
       `🎯 *TP1:* $${fmt(result.takeProfit1)} _(${pct(result.entry, result.takeProfit1)})_\n` +
       `🏆 *TP2:* $${fmt(result.takeProfit2)} _(${pct(result.entry, result.takeProfit2)})_\n` +
       `📊 *R:R:* 1:${result.riskReward.toFixed(1)}\n`;
+
+    // Position sizing — 2% risk model
+    if (capital !== null && capital > 0 && result.entry > 0) {
+      const slDistance = Math.abs(result.entry - result.stopLoss) / result.entry;
+      if (slDistance > 0) {
+        const riskAmount = capital * 0.02;
+        const rawPosition = riskAmount / slDistance;
+        const position = Math.min(rawPosition, capital);
+        positionLine = `💼 *Position:* $${fmt(position)} _(2% Risiko)_\n`;
+      }
+    }
   }
 
   return (
@@ -114,6 +127,7 @@ function buildAlertMessage(result: AnalysisResult): string {
     `${dir} confluence\n` +
     `💰 *Price:* $${fmt(result.price)}\n` +
     tradeLevels +
+    positionLine +
     `\n*Signals:*\n${allSignals}\n\n` +
     `_This is technical analysis, not financial advice._`
   );

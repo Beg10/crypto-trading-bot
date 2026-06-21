@@ -10,7 +10,7 @@ export const supabase: SupabaseClient = createClient(
   process.env.SUPABASE_KEY,
 );
 
-// ─── Users ───────────────────────────────────────────────────────────────────
+// ─── Users ───────────────────────────────────────────────────────────────────────────────
 
 export async function upsertUser(telegramId: number, username?: string): Promise<User> {
   const { data, error } = await supabase
@@ -38,7 +38,16 @@ export async function getUserByTelegramId(telegramId: number): Promise<User | nu
   return data as User;
 }
 
-// ─── Watchlist ────────────────────────────────────────────────────────────────
+export async function setCapital(userId: string, capital: number | null): Promise<void> {
+  const { error } = await supabase
+    .from('users')
+    .update({ capital })
+    .eq('id', userId);
+
+  if (error) throw new Error(`DB setCapital: ${error.message}`);
+}
+
+// ─── Watchlist ──────────────────────────────────────────────────────────────────────────────────
 
 export async function addToWatchlist(userId: string, symbol: string): Promise<void> {
   const { error } = await supabase
@@ -90,7 +99,7 @@ export async function getAllWatchedSymbols(): Promise<Array<{ symbol: string; us
   return Array.from(map.entries()).map(([symbol, user_ids]) => ({ symbol, user_ids }));
 }
 
-/** Resolves user_ids → telegram_ids for push notifications */
+/** Resolves user_ids -> telegram_ids for push notifications */
 export async function getTelegramIdsByUserIds(userIds: string[]): Promise<number[]> {
   if (userIds.length === 0) return [];
 
@@ -103,7 +112,26 @@ export async function getTelegramIdsByUserIds(userIds: string[]): Promise<number
   return (data ?? []).map((r) => r.telegram_id as number);
 }
 
-// ─── News Cache ───────────────────────────────────────────────────────────────
+/** Resolves user_ids -> { user_id, telegram_id, capital } for personalized alerts */
+export async function getUsersForAlert(
+  userIds: string[],
+): Promise<Array<{ user_id: string; telegram_id: number; capital: number | null }>> {
+  if (userIds.length === 0) return [];
+
+  const { data, error } = await supabase
+    .from('users')
+    .select('id, telegram_id, capital')
+    .in('id', userIds);
+
+  if (error) throw new Error(`DB getUsersForAlert: ${error.message}`);
+  return (data ?? []).map((r) => ({
+    user_id: r.id as string,
+    telegram_id: r.telegram_id as number,
+    capital: r.capital != null ? (r.capital as number) : null,
+  }));
+}
+
+// ─── News Cache ────────────────────────────────────────────────────────────────────────────────
 
 export async function upsertNewsItems(items: NewsItem[]): Promise<void> {
   if (items.length === 0) return;

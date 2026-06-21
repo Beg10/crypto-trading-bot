@@ -4,6 +4,7 @@ export interface User {
   username: string | null;
   plan: string;
   created_at: string;
+  capital: number | null;
 }
 
 export interface WatchlistEntry {
