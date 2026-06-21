@@ -1,169 +1,19 @@
 import {
-  RSI,
-  MACD,
-  BollingerBands,
-  ATR,
   EMA,
+  ATR,
 } from 'technicalindicators';
 import { Candle, AnalysisResult } from '../types';
 
-// ─── RSI ──────────────────────────────────────────────────────────────────────
+// ─── EMA Series ───────────────────────────────────────────────────────────────
 
-function calcRSI(closes: number[], period = 14): number | null {
-  if (closes.length < period + 1) return null;
-  const values = RSI.calculate({ values: closes, period });
-  return values.length > 0 ? values[values.length - 1] : null;
+function calcEMASeries(closes: number[], period: number): number[] {
+  if (closes.length < period) return [];
+  return EMA.calculate({ values: closes, period });
 }
 
-function calcRSISeries(closes: number[], period = 14): number[] {
-  if (closes.length < period + 1) return [];
-  return RSI.calculate({ values: closes, period });
-}
-
-// ─── StochRSI ─────────────────────────────────────────────────────────────────
-
-function calcStochRSI(
-  closes: number[],
-  rsiPeriod = 14,
-  stochPeriod = 14,
-  kPeriod = 3,
-  dPeriod = 3,
-): Array<{ k: number; d: number }> {
-  const rsiSeries = calcRSISeries(closes, rsiPeriod);
-  if (rsiSeries.length < stochPeriod + kPeriod + dPeriod - 2) return [];
-
-  const rawStoch: number[] = [];
-  for (let i = stochPeriod - 1; i < rsiSeries.length; i++) {
-    const window = rsiSeries.slice(i - stochPeriod + 1, i + 1);
-    const minRSI = Math.min(...window);
-    const maxRSI = Math.max(...window);
-    const range  = maxRSI - minRSI;
-    rawStoch.push(range === 0 ? 50 : ((rsiSeries[i] - minRSI) / range) * 100);
-  }
-
-  const kValues: number[] = [];
-  for (let i = kPeriod - 1; i < rawStoch.length; i++) {
-    const w = rawStoch.slice(i - kPeriod + 1, i + 1);
-    kValues.push(w.reduce((a, b) => a + b, 0) / kPeriod);
-  }
-
-  const result: Array<{ k: number; d: number }> = [];
-  for (let i = dPeriod - 1; i < kValues.length; i++) {
-    const w = kValues.slice(i - dPeriod + 1, i + 1);
-    const d = w.reduce((a, b) => a + b, 0) / dPeriod;
-    result.push({ k: kValues[i], d });
-  }
-  return result;
-}
-
-// ─── RSI Divergence ───────────────────────────────────────────────────────────
-
-function findSwingLows(values: number[], wing = 3): number[] {
-  const lows: number[] = [];
-  for (let i = wing; i < values.length - wing; i++) {
-    let isLow = true;
-    for (let j = 1; j <= wing; j++) {
-      if (values[i] >= values[i - j] || values[i] >= values[i + j]) { isLow = false; break; }
-    }
-    if (isLow) lows.push(i);
-  }
-  return lows;
-}
-
-function findSwingHighs(values: number[], wing = 3): number[] {
-  const highs: number[] = [];
-  for (let i = wing; i < values.length - wing; i++) {
-    let isHigh = true;
-    for (let j = 1; j <= wing; j++) {
-      if (values[i] <= values[i - j] || values[i] <= values[i + j]) { isHigh = false; break; }
-    }
-    if (isHigh) highs.push(i);
-  }
-  return highs;
-}
-
-function detectRSIDivergence(closes: number[], rsiPeriod = 14, lookback = 40): 'bullish' | 'bearish' | null {
-  const rsiSeries = calcRSISeries(closes, rsiPeriod);
-  const n = Math.min(lookback, rsiSeries.length, closes.length - rsiPeriod);
-  if (n < 10) return null;
-
-  const recentCloses = closes.slice(closes.length - n);
-  const recentRSI    = rsiSeries.slice(rsiSeries.length - n);
-
-  const priceLows = findSwingLows(recentCloses);
-  const rsiLows   = findSwingLows(recentRSI);
-  if (priceLows.length >= 2 && rsiLows.length >= 2) {
-    const pi1 = priceLows[priceLows.length - 2];
-    const pi2 = priceLows[priceLows.length - 1];
-    const ri1 = rsiLows.find((i) => Math.abs(i - pi1) <= 5);
-    const ri2 = rsiLows.slice().reverse().find((i) => Math.abs(i - pi2) <= 5);
-    if (ri1 !== undefined && ri2 !== undefined && ri1 !== ri2 &&
-        recentCloses[pi2] < recentCloses[pi1] && recentRSI[ri2] > recentRSI[ri1]) {
-      return 'bullish';
-    }
-  }
-
-  const priceHighs = findSwingHighs(recentCloses);
-  const rsiHighs   = findSwingHighs(recentRSI);
-  if (priceHighs.length >= 2 && rsiHighs.length >= 2) {
-    const pi1 = priceHighs[priceHighs.length - 2];
-    const pi2 = priceHighs[priceHighs.length - 1];
-    const ri1 = rsiHighs.find((i) => Math.abs(i - pi1) <= 5);
-    const ri2 = rsiHighs.slice().reverse().find((i) => Math.abs(i - pi2) <= 5);
-    if (ri1 !== undefined && ri2 !== undefined && ri1 !== ri2 &&
-        recentCloses[pi2] > recentCloses[pi1] && recentRSI[ri2] < recentRSI[ri1]) {
-      return 'bearish';
-    }
-  }
-  return null;
-}
-
-// ─── MACD ─────────────────────────────────────────────────────────────────────
-
-type MACDSignal = 'bullish_cross' | 'bearish_cross' | null;
-
-function calcMACDSignal(closes: number[]): MACDSignal {
-  if (closes.length < 35) return null;
-  const values = MACD.calculate({ values: closes, fastPeriod: 12, slowPeriod: 26, signalPeriod: 9, SimpleMAOscillator: false, SimpleMASignal: false });
-  if (values.length < 2) return null;
-  const prev = values[values.length - 2];
-  const curr = values[values.length - 1];
-  if (!prev.MACD || !prev.signal || !curr.MACD || !curr.signal) return null;
-  const prevDiff = prev.MACD - prev.signal;
-  const currDiff = curr.MACD - curr.signal;
-  if (prevDiff < 0 && currDiff >= 0) return 'bullish_cross';
-  if (prevDiff > 0 && currDiff <= 0) return 'bearish_cross';
-  return null;
-}
-
-// ─── Bollinger Bands ──────────────────────────────────────────────────────────
-
-type BBSignal = 'oversold' | 'overbought' | null;
-
-function calcBBSignal(closes: number[], period = 20): BBSignal {
-  if (closes.length < period) return null;
-  const values = BollingerBands.calculate({ values: closes, period, stdDev: 2 });
-  if (values.length === 0) return null;
-  const last  = values[values.length - 1];
-  const price = closes[closes.length - 1];
-  if (price <= last.lower) return 'oversold';
-  if (price >= last.upper) return 'overbought';
-  return null;
-}
-
-// ─── EMA Filters ─────────────────────────────────────────────────────────────
-
-function calcEMA50(closes: number[]): number | null {
-  if (closes.length < 50) return null;
-  const values = EMA.calculate({ values: closes, period: 50 });
-  return values.length > 0 ? values[values.length - 1] : null;
-}
-
-/** EMA200 on 4h = ~33-day macro trend filter. No longs below, no shorts above. */
-function calcEMA200(closes: number[]): number | null {
-  if (closes.length < 200) return null;
-  const values = EMA.calculate({ values: closes, period: 200 });
-  return values.length > 0 ? values[values.length - 1] : null;
+function calcEMALast(closes: number[], period: number): number | null {
+  const series = calcEMASeries(closes, period);
+  return series.length > 0 ? series[series.length - 1] : null;
 }
 
 // ─── Volume Filter ────────────────────────────────────────────────────────────
@@ -176,41 +26,16 @@ function calcVolumeRatio(candles: Candle[], period = 20): number | null {
   return avgVol > 0 ? curVol / avgVol : null;
 }
 
-// ─── Candlestick Patterns ─────────────────────────────────────────────────────
-
-function detectPatterns(candles: Candle[]): string[] {
-  if (candles.length < 2) return [];
-  const patterns: string[] = [];
-  const len = candles.length;
-  const c = candles[len - 1];
-  const p = candles[len - 2];
-  const cBody = Math.abs(c.close - c.open);
-  const cRange = c.high - c.low;
-  const pBody = Math.abs(p.close - p.open);
-  const cLowerShadow = Math.min(c.open, c.close) - c.low;
-  const cUpperShadow = c.high - Math.max(c.open, c.close);
-
-  if (cRange > 0 && cBody / cRange < 0.1) patterns.push('Doji');
-  if (cLowerShadow > cBody * 2 && cUpperShadow < cBody * 0.5 && c.close > c.open) patterns.push('Hammer');
-  if (cUpperShadow > cBody * 2 && cLowerShadow < cBody * 0.5 && c.close < c.open) patterns.push('Shooting Star');
-  if (p.close < p.open && c.close > c.open && c.open <= p.close && c.close >= p.open) patterns.push('Bullish Engulfing');
-  if (p.close > p.open && c.close < c.open && c.open >= p.close && c.close <= p.open) patterns.push('Bearish Engulfing');
-  if (cRange > 0 && cBody / cRange > 0.9) patterns.push(c.close > c.open ? 'Bullish Marubozu' : 'Bearish Marubozu');
-  if (len >= 3) {
-    const pp = candles[len - 3];
-    const ppBody = Math.abs(pp.close - pp.open);
-    if (pp.close < pp.open && ppBody > pBody * 2 && c.close > c.open && c.close > (pp.open + pp.close) / 2) {
-      patterns.push('Morning Star');
-    }
-  }
-  return patterns;
-}
-
 // ─── ATR & Trade Levels ───────────────────────────────────────────────────────
 
 function calcATR(candles: Candle[], period = 14): number | null {
   if (candles.length < period + 1) return null;
-  const values = ATR.calculate({ high: candles.map((c) => c.high), low: candles.map((c) => c.low), close: candles.map((c) => c.close), period });
+  const values = ATR.calculate({
+    high:  candles.map((c) => c.high),
+    low:   candles.map((c) => c.low),
+    close: candles.map((c) => c.close),
+    period,
+  });
   return values.length > 0 ? values[values.length - 1] : null;
 }
 
@@ -226,124 +51,120 @@ interface TradeLevels {
   entry: number; stopLoss: number; takeProfit1: number; takeProfit2: number; riskReward: number;
 }
 
-function calcTradeLevels(candles: Candle[], direction: 'bullish' | 'bearish'): TradeLevels {
+function calcTradeLevels(candles: Candle[], direction: 'bullish' | 'bearish'): TradeLevels | null {
   const price = candles[candles.length - 1].close;
   const atr   = calcATR(candles) ?? price * 0.02;
+
   if (direction === 'bullish') {
-    const sl   = Math.max(swingLow(candles, 20), price - atr * 2.0);
+    const sl   = Math.max(swingLow(candles, 20), price - atr * 1.5);
     const risk = price - sl;
-    return { entry: price, stopLoss: sl, takeProfit1: price + risk * 1.5, takeProfit2: price + risk * 3.0, riskReward: 1.5 };
+    if (risk <= 0 || risk / price > 0.08) return null; // skip if SL > 8%
+    return {
+      entry: price, stopLoss: sl,
+      takeProfit1: price + risk * 2.0,
+      takeProfit2: price + risk * 4.0,
+      riskReward: 2.0,
+    };
   } else {
-    const sl   = Math.min(swingHigh(candles, 20), price + atr * 2.0);
+    const sl   = Math.min(swingHigh(candles, 20), price + atr * 1.5);
     const risk = sl - price;
-    return { entry: price, stopLoss: sl, takeProfit1: price - risk * 1.5, takeProfit2: price - risk * 3.0, riskReward: 1.5 };
+    if (risk <= 0 || risk / price > 0.08) return null;
+    return {
+      entry: price, stopLoss: sl,
+      takeProfit1: price - risk * 2.0,
+      takeProfit2: price - risk * 4.0,
+      riskReward: 2.0,
+    };
   }
 }
 
-// ─── Combined Analysis ────────────────────────────────────────────────────────
+// ─── Main Analysis: EMA Cross Strategy ───────────────────────────────────────
+//
+// Signal fires when:
+//   LONG:  EMA20 crosses above EMA50 AND price > EMA200 (macro uptrend)
+//   SHORT: EMA20 crosses below EMA50 AND price < EMA200 (macro downtrend)
+//
+// This is a trend-following approach — we ride the trend, not fight it.
 
 export function analyzeCandles(symbol: string, candles: Candle[]): AnalysisResult {
   const closes = candles.map((c) => c.close);
   const price  = closes[closes.length - 1] ?? 0;
 
-  const rsi         = calcRSI(closes);
-  const macdSignal  = calcMACDSignal(closes);
-  const bbSignal    = calcBBSignal(closes);
-  const patterns    = detectPatterns(candles);
-  const ema50       = calcEMA50(closes);
-  const ema200      = calcEMA200(closes);
-  const volumeRatio = calcVolumeRatio(candles);
-  const divergence  = detectRSIDivergence(closes);
+  const ema20Series  = calcEMASeries(closes, 20);
+  const ema50Series  = calcEMASeries(closes, 50);
+  const ema200Series = calcEMASeries(closes, 200);
+  const volumeRatio  = calcVolumeRatio(candles);
 
-  const stochHistory = calcStochRSI(closes);
-  const stochCurr    = stochHistory.length > 0 ? stochHistory[stochHistory.length - 1] : null;
-  const stochPrev    = stochHistory.length > 1 ? stochHistory[stochHistory.length - 2] : null;
-  const stochBullCross = stochPrev !== null && stochCurr !== null && stochPrev.k <= stochPrev.d && stochCurr.k > stochCurr.d;
-  const stochBearCross = stochPrev !== null && stochCurr !== null && stochPrev.k >= stochPrev.d && stochCurr.k < stochCurr.d;
+  const ema20  = ema20Series.length  > 0 ? ema20Series[ema20Series.length - 1]   : null;
+  const ema20p = ema20Series.length  > 1 ? ema20Series[ema20Series.length - 2]   : null;
+  const ema50  = ema50Series.length  > 0 ? ema50Series[ema50Series.length - 1]   : null;
+  const ema50p = ema50Series.length  > 1 ? ema50Series[ema50Series.length - 2]   : null;
+  const ema200 = ema200Series.length > 0 ? ema200Series[ema200Series.length - 1] : null;
 
-  // ── Trend filters ─────────────────────────────────────────────────────────────
-  // EMA50: short-term trend. EMA200: macro trend (on 4h ≈ 33 days).
-  // Both must confirm direction — this is the main quality gate.
-  const trendAllowsBull = (ema50 === null || price > ema50) && (ema200 === null || price > ema200);
-  const trendAllowsBear = (ema50 === null || price < ema50) && (ema200 === null || price < ema200);
-  const volumeOk        = volumeRatio === null || volumeRatio >= 1.0;
+  // Volume must be at least average
+  const volumeOk = volumeRatio === null || volumeRatio >= 1.0;
 
+  // EMA20/50 cross detection
+  const goldenCross = ema20p !== null && ema50p !== null && ema20 !== null && ema50 !== null &&
+    ema20p <= ema50p && ema20 > ema50;
+  const deathCross  = ema20p !== null && ema50p !== null && ema20 !== null && ema50 !== null &&
+    ema20p >= ema50p && ema20 < ema50;
+
+  // Macro trend filter: EMA200 must confirm
+  const macroUptrend   = ema200 === null || price > ema200;
+  const macroDowntrend = ema200 === null || price < ema200;
+
+  let direction: 'bullish' | 'bearish' | null = null;
+  if (goldenCross && macroUptrend   && volumeOk) direction = 'bullish';
+  if (deathCross  && macroDowntrend && volumeOk) direction = 'bearish';
+
+  // Build signal info lines
   const signals: string[] = [];
-
-  if (rsi !== null) {
-    if (rsi < 30) signals.push(`RSI Oversold (${rsi.toFixed(1)})`);
-    else if (rsi > 70) signals.push(`RSI Overbought (${rsi.toFixed(1)})`);
+  if (ema20 !== null && ema50 !== null) {
+    if (goldenCross) signals.push(`EMA20 kreuzt EMA50 nach oben (Golden Cross) 📈`);
+    if (deathCross)  signals.push(`EMA20 kreuzt EMA50 nach unten (Death Cross) 📉`);
+    signals.push(`EMA20: $${ema20.toFixed(2)} | EMA50: $${ema50.toFixed(2)}`);
   }
-  if (stochCurr !== null) {
-    if (stochBullCross && stochCurr.k < 50) signals.push(`StochRSI Bullish Cross (K:${stochCurr.k.toFixed(1)})`);
-    else if (stochBearCross && stochCurr.k > 50) signals.push(`StochRSI Bearish Cross (K:${stochCurr.k.toFixed(1)})`);
-    else if (stochCurr.k < 20) signals.push(`StochRSI Oversold (K:${stochCurr.k.toFixed(1)})`);
-    else if (stochCurr.k > 80) signals.push(`StochRSI Overbought (K:${stochCurr.k.toFixed(1)})`);
+  if (ema200 !== null) {
+    signals.push(`EMA200: $${ema200.toFixed(2)} — Makrotrend ${price > ema200 ? '↗ bullisch' : '↘ baerisch'}`);
   }
-  if (macdSignal === 'bullish_cross') signals.push('MACD Bullish Cross');
-  if (macdSignal === 'bearish_cross') signals.push('MACD Bearish Cross');
-  if (bbSignal === 'oversold')   signals.push('Below Lower Bollinger Band');
-  if (bbSignal === 'overbought') signals.push('Above Upper Bollinger Band');
-  signals.push(...patterns);
-  if (divergence === 'bullish') signals.push('RSI Bullische Divergenz');
-  if (divergence === 'bearish') signals.push('RSI Baerische Divergenz');
+  if (volumeRatio !== null) {
+    signals.push(`Volumen: ${volumeRatio.toFixed(2)}x Durchschnitt ${volumeRatio >= 1.0 ? '✅' : '⚠️'}`);
+  }
 
-  if (ema50 !== null)  signals.push(`EMA50: $${ema50.toFixed(2)} ${price > ema50 ? '↗' : '↘'}`);
-  if (ema200 !== null) signals.push(`EMA200: $${ema200.toFixed(2)} ${price > ema200 ? '↗ Makro bullisch' : '↘ Makro baerisch'}`);
-  if (volumeRatio !== null) signals.push(`Volumen: ${volumeRatio.toFixed(2)}x Ø ${volumeRatio >= 1.0 ? '✅' : '⚠️'}`);
-
-  const bullishPatterns = ['Bullish Engulfing', 'Hammer', 'Morning Star', 'Bullish Marubozu'];
-  const bearishPatterns = ['Bearish Engulfing', 'Shooting Star', 'Bearish Marubozu'];
-
-  const bullishScore =
-    (rsi !== null && rsi < 30 ? 1 : 0) +
-    (macdSignal === 'bullish_cross' ? 1 : 0) +
-    (bbSignal === 'oversold' ? 1 : 0) +
-    (patterns.some((p) => bullishPatterns.includes(p)) ? 1 : 0) +
-    ((stochBullCross || (stochCurr !== null && stochCurr.k < 20)) ? 1 : 0) +
-    (divergence === 'bullish' ? 2 : 0);
-
-  const bearishScore =
-    (rsi !== null && rsi > 70 ? 1 : 0) +
-    (macdSignal === 'bearish_cross' ? 1 : 0) +
-    (bbSignal === 'overbought' ? 1 : 0) +
-    (patterns.some((p) => bearishPatterns.includes(p)) ? 1 : 0) +
-    ((stochBearCross || (stochCurr !== null && stochCurr.k > 80)) ? 1 : 0) +
-    (divergence === 'bearish' ? 2 : 0);
-
-  let direction:   'bullish' | 'bearish' | null = null;
   let entry:       number | null = null;
   let stopLoss:    number | null = null;
   let takeProfit1: number | null = null;
   let takeProfit2: number | null = null;
   let riskReward:  number | null = null;
 
-  // ── Score threshold raised to 3 for higher signal quality ────────────────────
-  const isBullish = bullishScore >= 3 && trendAllowsBull && volumeOk;
-  const isBearish = bearishScore >= 3 && trendAllowsBear && volumeOk;
-
-  if (isBullish || isBearish) {
-    direction = isBullish && bullishScore >= bearishScore ? 'bullish' : 'bearish';
-    if (direction === 'bullish' && !isBullish) direction = null;
-    if (direction === 'bearish' && !isBearish) direction = null;
-  }
-
   if (direction !== null) {
     const levels = calcTradeLevels(candles, direction);
-    entry       = levels.entry;
-    stopLoss    = levels.stopLoss;
-    takeProfit1 = levels.takeProfit1;
-    takeProfit2 = levels.takeProfit2;
-    riskReward  = levels.riskReward;
+    if (levels) {
+      entry       = levels.entry;
+      stopLoss    = levels.stopLoss;
+      takeProfit1 = levels.takeProfit1;
+      takeProfit2 = levels.takeProfit2;
+      riskReward  = levels.riskReward;
+    } else {
+      direction = null; // invalid levels, skip signal
+    }
   }
 
   return {
-    symbol, price, rsi, macdSignal, bbSignal, patterns, signals,
-    direction, entry, stopLoss, takeProfit1, takeProfit2, riskReward,
-    ema50, volumeRatio,
-    stochRsiK:  stochCurr?.k ?? null,
-    stochRsiD:  stochCurr?.d ?? null,
-    divergence,
+    symbol, price,
+    rsi:         null,
+    macdSignal:  null,
+    bbSignal:    null,
+    patterns:    [],
+    signals,
+    direction,
+    entry, stopLoss, takeProfit1, takeProfit2, riskReward,
+    ema50,
+    volumeRatio,
+    stochRsiK:  null,
+    stochRsiD:  null,
+    divergence: null,
   };
 }
 

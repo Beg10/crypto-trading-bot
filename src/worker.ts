@@ -37,11 +37,8 @@ const INTERVAL_MS = (parseInt(process.env.WORKER_INTERVAL_MINUTES ?? '5', 10)) *
 
 // ─── Channel config ───────────────────────────────────────────────────────────
 const CHANNEL_ID: string | null = process.env.CHANNEL_ID ?? null;
-const CHANNEL_SYMBOLS = [
-  'BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT',
-  'ADAUSDT', 'DOGEUSDT', 'AVAXUSDT', 'DOTUSDT', 'LINKUSDT',
-  'UNIUSDT', 'LTCUSDT', 'ATOMUSDT', 'NEARUSDT', 'MATICUSDT',
-];
+// Best performing coins from backtest analysis (EMA cross strategy)
+const CHANNEL_SYMBOLS = ['XRPUSDT', 'LTCUSDT', 'ATOMUSDT', 'BTCUSDT', 'BNBUSDT'];
 
 // ─── Daily recap tracking ────────────────────────────────────────────────────
 let lastRecapDate = '';
