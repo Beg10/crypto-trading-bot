@@ -77,32 +77,44 @@ async function runAnalysis(): Promise<void> {
   }
 }
 
-function buildAlertMessage(result: AnalysisResult): string {
-  const bullishSignals = result.signals.filter(
-    (s) =>
-      s.includes('Oversold') ||
-      s.includes('Bullish') ||
-      s.includes('Below Lower') ||
-      s.includes('Hammer') ||
-      s.includes('Morning Star'),
-  );
-  const bearishSignals = result.signals.filter(
-    (s) =>
-      s.includes('Overbought') ||
-      s.includes('Bearish') ||
-      s.includes('Above Upper') ||
-      s.includes('Shooting Star'),
-  );
+function fmt(n: number): string {
+  // Auto-precision: enough decimals for small altcoins
+  if (n >= 1000) return n.toLocaleString('en-US', { maximumFractionDigits: 2 });
+  if (n >= 1) return n.toLocaleString('en-US', { maximumFractionDigits: 4 });
+  return n.toLocaleString('en-US', { maximumFractionDigits: 6 });
+}
 
-  const direction = bullishSignals.length >= bearishSignals.length ? '🟢 BULLISH' : '🔴 BEARISH';
+function pct(from: number, to: number): string {
+  const p = ((to - from) / from) * 100;
+  return (p >= 0 ? '+' : '') + p.toFixed(2) + '%';
+}
+
+function buildAlertMessage(result: AnalysisResult): string {
+  const dir = result.direction === 'bullish' ? '🟢 BULLISH' : '🔴 BEARISH';
   const allSignals = result.signals.map((s) => `  • ${s}`).join('\n');
-  const price = result.price.toLocaleString('en-US', { maximumFractionDigits: 4 });
+
+  let tradeLevels = '';
+  if (
+    result.entry !== null &&
+    result.stopLoss !== null &&
+    result.takeProfit1 !== null &&
+    result.takeProfit2 !== null &&
+    result.riskReward !== null
+  ) {
+    tradeLevels =
+      `\n📍 *Entry:* $${fmt(result.entry)}\n` +
+      `🛑 *Stop Loss:* $${fmt(result.stopLoss)} _(${pct(result.entry, result.stopLoss)})_\n` +
+      `🎯 *TP1:* $${fmt(result.takeProfit1)} _(${pct(result.entry, result.takeProfit1)})_\n` +
+      `🏆 *TP2:* $${fmt(result.takeProfit2)} _(${pct(result.entry, result.takeProfit2)})_\n` +
+      `📊 *R:R:* 1:${result.riskReward.toFixed(1)}\n`;
+  }
 
   return (
     `⚡ *Signal Alert — ${result.symbol}*\n\n` +
-    `${direction} confluence detected\n` +
-    `Price: *$${price}*\n\n` +
-    `*Signals:*\n${allSignals}\n\n` +
+    `${dir} confluence\n` +
+    `💰 *Price:* $${fmt(result.price)}\n` +
+    tradeLevels +
+    `\n*Signals:*\n${allSignals}\n\n` +
     `_This is technical analysis, not financial advice._`
   );
 }
@@ -160,20 +172,14 @@ async function notifyAdmin(message: string): Promise<void> {
 async function main(): Promise<void> {
   console.log(`[worker] Starting — interval: ${INTERVAL_MS / 60000} min`);
   await notifyAdmin(`⚙️ *Worker gestartet!*\nAnalyse-Intervall: ${INTERVAL_MS / 60000} min\n_${new Date().toISOString()}_`);
+  setInterval(tick, INTERVAL_MS);
   await tick();
-  setInterval(() => {
-    tick().catch((e) => console.error('[worker] Unhandled tick error:', e));
-  }, INTERVAL_MS);
 }
 
 process.on('uncaughtException', async (err) => {
-  console.error('[worker] Uncaught exception:', err);
   await notifyAdmin(`🔴 *Worker crashed!*\n\`${err.message}\`\n\nRailway wird neu starten…`);
-  process.exit(1);
 });
 
 main().catch(async (e) => {
-  console.error('[worker] Fatal error:', e);
   await notifyAdmin(`🔴 *Worker fatal error!*\n\`${(e as Error).message}\``);
-  process.exit(1);
 });

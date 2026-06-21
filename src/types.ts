@@ -54,6 +54,13 @@ export interface AnalysisResult {
   bbSignal: 'oversold' | 'overbought' | null;
   patterns: string[];
   signals: string[];
+  // Trade levels
+  direction: 'bullish' | 'bearish' | null;
+  entry: number | null;
+  stopLoss: number | null;
+  takeProfit1: number | null;
+  takeProfit2: number | null;
+  riskReward: number | null;
 }
 
 export interface CoinMarketData {

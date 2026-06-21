@@ -2,10 +2,11 @@ import {
   RSI,
   MACD,
   BollingerBands,
+  ATR,
 } from 'technicalindicators';
 import { Candle, AnalysisResult } from '../types';
 
-// ─── RSI ─────────────────────────────────────────────────────────────────────
+// ─── RSI ────────────────────────────────────────────────────────────────────────────
 
 function calcRSI(closes: number[], period = 14): number | null {
   if (closes.length < period + 1) return null;
@@ -13,7 +14,7 @@ function calcRSI(closes: number[], period = 14): number | null {
   return values.length > 0 ? values[values.length - 1] : null;
 }
 
-// ─── MACD ────────────────────────────────────────────────────────────────────
+// ─── MACD ────────────────────────────────────────────────────────────────────────────
 
 type MACDSignal = 'bullish_cross' | 'bearish_cross' | null;
 
@@ -44,7 +45,7 @@ function calcMACDSignal(closes: number[]): MACDSignal {
   return null;
 }
 
-// ─── Bollinger Bands ─────────────────────────────────────────────────────────
+// ─── Bollinger Bands ───────────────────────────────────────────────────────────────────
 
 type BBSignal = 'oversold' | 'overbought' | null;
 
@@ -66,7 +67,7 @@ function calcBBSignal(closes: number[], period = 20): BBSignal {
   return null;
 }
 
-// ─── Candlestick Patterns ─────────────────────────────────────────────────────
+// ─── Candlestick Patterns ───────────────────────────────────────────────────────────────────────
 
 /**
  * Detects basic candlestick patterns from the last 2-3 candles.
@@ -143,7 +144,63 @@ function detectPatterns(candles: Candle[]): string[] {
   return patterns;
 }
 
-// ─── Combined Analysis ─────────────────────────────────────────────────────────
+// ─── ATR & Trade Levels ──────────────────────────────────────────────────────────────────────────────
+
+function calcATR(candles: Candle[], period = 14): number | null {
+  if (candles.length < period + 1) return null;
+  const values = ATR.calculate({
+    high: candles.map((c) => c.high),
+    low: candles.map((c) => c.low),
+    close: candles.map((c) => c.close),
+    period,
+  });
+  return values.length > 0 ? values[values.length - 1] : null;
+}
+
+function swingLow(candles: Candle[], lookback = 20): number {
+  return Math.min(...candles.slice(-lookback).map((c) => c.low));
+}
+
+function swingHigh(candles: Candle[], lookback = 20): number {
+  return Math.max(...candles.slice(-lookback).map((c) => c.high));
+}
+
+interface TradeLevels {
+  entry: number;
+  stopLoss: number;
+  takeProfit1: number;
+  takeProfit2: number;
+  riskReward: number;
+}
+
+function calcTradeLevels(candles: Candle[], direction: 'bullish' | 'bearish'): TradeLevels {
+  const price = candles[candles.length - 1].close;
+  const atr = calcATR(candles) ?? price * 0.02;
+
+  if (direction === 'bullish') {
+    const sl = Math.max(swingLow(candles, 20), price - atr * 1.5);
+    const risk = price - sl;
+    return {
+      entry: price,
+      stopLoss: sl,
+      takeProfit1: price + risk * 1.5,
+      takeProfit2: price + risk * 3.0,
+      riskReward: risk > 0 ? (risk * 1.5) / risk : 1.5,
+    };
+  } else {
+    const sl = Math.min(swingHigh(candles, 20), price + atr * 1.5);
+    const risk = sl - price;
+    return {
+      entry: price,
+      stopLoss: sl,
+      takeProfit1: price - risk * 1.5,
+      takeProfit2: price - risk * 3.0,
+      riskReward: risk > 0 ? (risk * 1.5) / risk : 1.5,
+    };
+  }
+}
+
+// ─── Combined Analysis ────────────────────────────────────────────────────────────────────────────────
 
 /**
  * Runs full technical analysis on a set of candles and produces actionable signals.
@@ -176,7 +233,40 @@ export function analyzeCandles(symbol: string, candles: Candle[]): AnalysisResul
   // Pattern signals
   signals.push(...patterns);
 
-  return { symbol, price, rsi, macdSignal, bbSignal, patterns, signals };
+  // ─── Direction & trade levels ──────────────────────────────────────────────────────────────────────────────
+  const bullishPatterns = ['Bullish Engulfing', 'Hammer', 'Morning Star', 'Bullish Marubozu'];
+  const bearishPatterns = ['Bearish Engulfing', 'Shooting Star', 'Bearish Marubozu'];
+
+  const bullishScore =
+    (rsi !== null && rsi < 30 ? 1 : 0) +
+    (macdSignal === 'bullish_cross' ? 1 : 0) +
+    (bbSignal === 'oversold' ? 1 : 0) +
+    (patterns.some((p) => bullishPatterns.includes(p)) ? 1 : 0);
+
+  const bearishScore =
+    (rsi !== null && rsi > 70 ? 1 : 0) +
+    (macdSignal === 'bearish_cross' ? 1 : 0) +
+    (bbSignal === 'overbought' ? 1 : 0) +
+    (patterns.some((p) => bearishPatterns.includes(p)) ? 1 : 0);
+
+  let direction: 'bullish' | 'bearish' | null = null;
+  let entry: number | null = null;
+  let stopLoss: number | null = null;
+  let takeProfit1: number | null = null;
+  let takeProfit2: number | null = null;
+  let riskReward: number | null = null;
+
+  if (bullishScore >= 2 || bearishScore >= 2) {
+    direction = bullishScore >= bearishScore ? 'bullish' : 'bearish';
+    const levels = calcTradeLevels(candles, direction);
+    entry = levels.entry;
+    stopLoss = levels.stopLoss;
+    takeProfit1 = levels.takeProfit1;
+    takeProfit2 = levels.takeProfit2;
+    riskReward = levels.riskReward;
+  }
+
+  return { symbol, price, rsi, macdSignal, bbSignal, patterns, signals, direction, entry, stopLoss, takeProfit1, takeProfit2, riskReward };
 }
 
 /**
