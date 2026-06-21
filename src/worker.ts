@@ -30,8 +30,6 @@ const bot = new Bot(process.env.BOT_TOKEN);
 const INTERVAL_MS = (parseInt(process.env.WORKER_INTERVAL_MINUTES ?? '5', 10)) * 60 * 1000;
 
 // ─── Signal deduplication ─────────────────────────────────────────────────────
-// Tracks the last time a signal was sent per symbol to avoid spam.
-// In production you'd store this in Redis or the DB; in-process map is fine for single-instance.
 const lastAlertTime = new Map<string, number>();
 const ALERT_COOLDOWN_MS = 60 * 60 * 1000; // 1 hour per symbol
 
@@ -53,7 +51,6 @@ async function runAnalysis(): Promise<void> {
 
       if (!isNotifiableSignal(result)) continue;
 
-      // Cooldown check
       const lastTime = lastAlertTime.get(symbol) ?? 0;
       if (Date.now() - lastTime < ALERT_COOLDOWN_MS) {
         console.log(`[worker] ${symbol} alert suppressed (cooldown)`);
@@ -69,14 +66,12 @@ async function runAnalysis(): Promise<void> {
         try {
           await bot.api.sendMessage(telegramId, message, { parse_mode: 'Markdown' });
         } catch (e) {
-          // User may have blocked the bot — log and continue
           console.error(`[worker] sendMessage to ${telegramId} failed:`, (e as Error).message);
         }
       }
 
       console.log(`[worker] Alert sent for ${symbol} to ${telegramIds.length} user(s)`);
     } catch (e) {
-      // Don't let one failed symbol abort the whole loop
       console.error(`[worker] Analysis failed for ${symbol}:`, (e as Error).message);
     }
   }
@@ -142,7 +137,7 @@ async function runNewsPipeline(): Promise<void> {
   }
 }
 
-// ─── Main loop ────────────────────────────────────────────────────────────────
+// ─── Tick ─────────────────────────────────────────────────────────────────────
 
 async function tick(): Promise<void> {
   await Promise.allSettled([runAnalysis(), runNewsPipeline()]);
@@ -154,4 +149,31 @@ async function notifyAdmin(message: string): Promise<void> {
   const adminId = process.env.ADMIN_CHAT_ID;
   if (!adminId) return;
   try {
-    await bot.api.sendMessage(adminId, message, { parse_
+    await bot.api.sendMessage(adminId, message, { parse_mode: 'Markdown' });
+  } catch (e) {
+    console.error('[monitor] Failed to notify admin:', (e as Error).message);
+  }
+}
+
+// ─── Entry point ──────────────────────────────────────────────────────────────
+
+async function main(): Promise<void> {
+  console.log(`[worker] Starting — interval: ${INTERVAL_MS / 60000} min`);
+  await notifyAdmin(`⚙️ *Worker gestartet!*\nAnalyse-Intervall: ${INTERVAL_MS / 60000} min\n_${new Date().toISOString()}_`);
+  await tick();
+  setInterval(() => {
+    tick().catch((e) => console.error('[worker] Unhandled tick error:', e));
+  }, INTERVAL_MS);
+}
+
+process.on('uncaughtException', async (err) => {
+  console.error('[worker] Uncaught exception:', err);
+  await notifyAdmin(`🔴 *Worker crashed!*\n\`${err.message}\`\n\nRailway wird neu starten…`);
+  process.exit(1);
+});
+
+main().catch(async (e) => {
+  console.error('[worker] Fatal error:', e);
+  await notifyAdmin(`🔴 *Worker fatal error!*\n\`${(e as Error).message}\``);
+  process.exit(1);
+});
