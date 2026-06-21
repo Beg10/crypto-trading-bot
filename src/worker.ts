@@ -223,7 +223,7 @@ async function runAnalysis(): Promise<void> {
 
   for (const { symbol, user_ids } of watched) {
     try {
-      const candles = await getCandles(symbol, '1h', 100);
+      const candles = await getCandles(symbol, '4h', 100);
 
       // 1. Check active trade for this symbol
       const activeTrade = activeTrades.get(symbol);
