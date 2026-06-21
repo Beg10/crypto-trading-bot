@@ -9,6 +9,7 @@ import { handleNews } from './commands/news';
 import { handleMarket } from './commands/market';
 import { handleCapital } from './commands/capital';
 import { handleStatus } from './commands/status';
+import { buildRecapMessage } from './commands/recap';
 
 if (!process.env.BOT_TOKEN) {
   throw new Error('BOT_TOKEN environment variable is not set');
@@ -38,8 +39,13 @@ bot.command('news', handleNews);
 bot.command('market', handleMarket);
 bot.command('capital', handleCapital);
 bot.command('status', handleStatus);
+bot.command('recap', async (ctx) => {
+  await ctx.reply('Lade Recap...', { parse_mode: 'Markdown' });
+  const msg = await buildRecapMessage();
+  await ctx.reply(msg, { parse_mode: 'Markdown' });
+});
 
-// Returns the user's Telegram chat ID — needed once to set ADMIN_CHAT_ID
+// Returns the user's Telegram chat ID -- needed once to set ADMIN_CHAT_ID
 bot.command('myid', async (ctx) => {
   await ctx.reply(`Your chat ID: \`${ctx.chat.id}\``, { parse_mode: 'Markdown' });
 });
@@ -69,7 +75,7 @@ bot.catch((err) => {
 
 process.on('uncaughtException', async (err) => {
   console.error('[bot] Uncaught exception:', err);
-  await notifyAdmin(`🔴 *Bot crashed!*\n\`${err.message}\`\n\nRailway wird neu starten…`);
+  await notifyAdmin(`🔴 *Bot crashed!*\n\`${err.message}\`\n\nRailway wird neu starten...`);
   process.exit(1);
 });
 
@@ -85,8 +91,8 @@ bot
   .catch(async (e) => {
     // 409 = another instance already polling (Railway deploy overlap)
     if (e instanceof GrammyError && e.error_code === 409) {
-      console.log('[bot] 409 conflict — old instance still running, restarting…');
-      process.exit(1); // Railway restarts immediately, conflict resolves itself
+      console.log('[bot] 409 conflict - old instance still running, restarting...');
+      process.exit(1);
     }
     console.error('[bot] bot.start() fatal error:', e);
     await notifyAdmin(`🔴 *Bot fatal error!*\n\`${(e as Error).message}\``);

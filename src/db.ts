@@ -238,3 +238,32 @@ export async function getRecentSignals(limitDays = 30): Promise<SignalLogEntry[]
   if (error) throw new Error(`DB getRecentSignals: ${error.message}`);
   return (data ?? []) as SignalLogEntry[];
 }
+
+export async function getDailySignals(): Promise<SignalLogEntry[]> {
+  // Midnight today in Europe/Berlin timezone → UTC
+  const now = new Date();
+  const berlinMidnight = new Date(
+    new Date(now.toLocaleString('en-US', { timeZone: 'Europe/Berlin' }))
+      .toISOString()
+      .split('T')[0] + 'T00:00:00',
+  );
+  // Adjust for Berlin offset (CET=+1, CEST=+2)
+  const offsetMs = now.getTime() - new Date(now.toLocaleString('en-US', { timeZone: 'Europe/Berlin' })).getTime();
+  const since = new Date(berlinMidnight.getTime() + offsetMs).toISOString();
+
+  const { data, error } = await supabase
+    .from('signal_log')
+    .select('*')
+    .gte('opened_at', since)
+    .order('opened_at', { ascending: true });
+  if (error) throw new Error(`DB getDailySignals: ${error.message}`);
+  return (data ?? []) as SignalLogEntry[];
+}
+
+export async function getAllUsers(): Promise<Array<{ telegram_id: number }>> {
+  const { data, error } = await supabase
+    .from('users')
+    .select('telegram_id');
+  if (error) throw new Error(`DB getAllUsers: ${error.message}`);
+  return (data ?? []) as Array<{ telegram_id: number }>;
+}

@@ -14,6 +14,7 @@ import { Bot } from 'grammy';
 import {
   getAllWatchedSymbols,
   getUsersForAlert,
+  getAllUsers,
   upsertNewsItems,
   logSignal,
   closeSignal,
@@ -23,6 +24,7 @@ import { analyzeCandles, isNotifiableSignal } from './services/analysis';
 import { fetchCryptoPanicNews } from './services/cryptopanic';
 import { fetchAndAnalyzeMacroNews } from './services/news';
 import { AnalysisResult } from './types';
+import { sendDailyRecap } from './commands/recap';
 
 if (!process.env.BOT_TOKEN) {
   throw new Error('BOT_TOKEN environment variable is not set');
@@ -34,6 +36,9 @@ const INTERVAL_MS = (parseInt(process.env.WORKER_INTERVAL_MINUTES ?? '5', 10)) *
 // ─── Channel config ───────────────────────────────────────────────────────────
 const CHANNEL_ID: string | null = process.env.CHANNEL_ID ?? null;
 const CHANNEL_SYMBOLS = ['ETHUSDT', 'SOLUSDT', 'BNBUSDT'];
+
+// ─── Daily recap tracking ────────────────────────────────────────────────────
+let lastRecapDate = '';
 
 // ─── Signal deduplication ─────────────────────────────────────────────────────
 const lastAlertTime = new Map<string, number>();
@@ -433,10 +438,42 @@ async function runNewsPipeline(): Promise<void> {
   }
 }
 
+// ─── Daily recap at 20:00 CET/CEST ──────────────────────────────────────────
+
+async function checkDailyRecap(): Promise<void> {
+  const now = new Date();
+  // Get current time in Berlin timezone
+  const berlinStr = now.toLocaleString('en-US', { timeZone: 'Europe/Berlin', hour12: false, hour: '2-digit', minute: '2-digit' });
+  const [hourStr, minuteStr] = berlinStr.split(':');
+  const hour   = parseInt(hourStr, 10);
+  const minute = parseInt(minuteStr, 10);
+
+  // Date string in Berlin (to track if recap already sent today)
+  const berlinDate = new Date(now.toLocaleString('en-US', { timeZone: 'Europe/Berlin' }))
+    .toISOString().split('T')[0];
+
+  // Fire once when clock hits 20:00–20:04 Berlin time
+  if (hour === 20 && minute < 5 && berlinDate !== lastRecapDate) {
+    lastRecapDate = berlinDate;
+
+    // Get all user telegram_ids to notify
+    let userIds: number[] = [];
+    try {
+      const users = await getAllUsers();
+      userIds = users.map((u) => u.telegram_id);
+    } catch (e) {
+      console.error('[recap] Failed to fetch users:', (e as Error).message);
+    }
+
+    await sendDailyRecap(bot, CHANNEL_ID, userIds);
+  }
+}
+
 // ─── Tick ─────────────────────────────────────────────────────────────────────
 
 async function tick(): Promise<void> {
   await Promise.allSettled([runAnalysis(), runNewsPipeline()]);
+  await checkDailyRecap();
 }
 
 // ─── Admin notification ───────────────────────────────────────────────────────
