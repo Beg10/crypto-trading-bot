@@ -28,14 +28,12 @@ const bot = new Bot(process.env.BOT_TOKEN);
 const INTERVAL_MS = (parseInt(process.env.WORKER_INTERVAL_MINUTES ?? '5', 10)) * 60 * 1000;
 
 // ─── Channel config ───────────────────────────────────────────────────────────
-// Set CHANNEL_ID env var to your channel username or numeric ID
 const CHANNEL_ID: string | null = process.env.CHANNEL_ID ?? null;
-// Symbols always broadcast to channel (independent of user watchlists)
 const CHANNEL_SYMBOLS = ['ETHUSDT', 'SOLUSDT', 'BNBUSDT'];
 
 // ─── Signal deduplication ─────────────────────────────────────────────────────
 const lastAlertTime = new Map<string, number>();
-const ALERT_COOLDOWN_MS = 60 * 60 * 1000; // 1 hour per symbol
+const ALERT_COOLDOWN_MS = 60 * 60 * 1000;
 
 // ─── Active trade tracking ────────────────────────────────────────────────────
 
@@ -49,7 +47,8 @@ interface ActiveTrade {
   users:         Array<{ telegram_id: number; capital: number | null }>;
   openTime:      number;
   tp1Hit:        boolean;
-  postToChannel: boolean; // whether to also send exit messages to channel
+  postToChannel: boolean;
+  positionSize:  number | null; // stored per-user not possible, use first user or null
 }
 
 const activeTrades = new Map<string, ActiveTrade>();
@@ -62,9 +61,31 @@ function fmt(n: number): string {
   return n.toLocaleString('en-US', { maximumFractionDigits: 6 });
 }
 
+function fmtMoney(n: number): string {
+  return n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
 function pct(from: number, to: number): string {
   const p = ((to - from) / from) * 100;
   return (p >= 0 ? '+' : '') + p.toFixed(2) + '%';
+}
+
+function nowUTC(): string {
+  return new Date().toLocaleString('de-DE', {
+    timeZone: 'UTC',
+    day: '2-digit', month: '2-digit', year: 'numeric',
+    hour: '2-digit', minute: '2-digit',
+  }) + ' UTC';
+}
+
+// ─── Trade links ─────────────────────────────────────────────────────────────
+
+function tradeLinks(symbol: string): string {
+  const base  = symbol.replace(/USDT$|BUSD$/, '');
+  const quote = symbol.includes('USDT') ? 'USDT' : 'BUSD';
+  const tv    = `https://www.tradingview.com/chart/?symbol=BINANCE:${symbol}&interval=240`;
+  const bnb   = `https://www.binance.com/en/trade/${base}_${quote}`;
+  return `[📊 Chart ansehen](${tv}) · [🏦 Auf Binance handeln](${bnb})`;
 }
 
 // ─── Channel helper ───────────────────────────────────────────────────────────
@@ -81,12 +102,15 @@ async function sendToChannel(message: string): Promise<void> {
 // ─── Message builders ─────────────────────────────────────────────────────────
 
 function buildEntryMessage(result: AnalysisResult, capital: number | null = null): string {
-  const dir = result.direction === 'bullish'
-    ? '🟢 GEH REIN'
-    : '⚠️ FINGER WEG — Preis könnte fallen';
+  const isBull = result.direction === 'bullish';
+  const dirLine = isBull
+    ? '🟢 *GEH REIN* — Long Position eröffnen'
+    : '⚠️ *FINGER WEG* — Bärisches Signal, kein Trade';
+
   const allSignals = result.signals.map((s) => `  • ${s}`).join('\n');
 
   let tradeLevels = '';
+  let moneyLines  = '';
   let positionLine = '';
 
   if (
@@ -96,63 +120,98 @@ function buildEntryMessage(result: AnalysisResult, capital: number | null = null
     result.takeProfit2 !== null &&
     result.riskReward !== null
   ) {
+    const riskPct   = pct(result.entry, result.stopLoss);
+    const tp1Pct    = pct(result.entry, result.takeProfit1);
+    const tp2Pct    = pct(result.entry, result.takeProfit2);
+    const slDist    = Math.abs(result.entry - result.stopLoss);
+
     tradeLevels =
       `\n📍 *Entry:* $${fmt(result.entry)}\n` +
-      `🛑 *Stop Loss:* $${fmt(result.stopLoss)} _(${pct(result.entry, result.stopLoss)})_\n` +
-      `🎯 *TP1:* $${fmt(result.takeProfit1)} _(${pct(result.entry, result.takeProfit1)})_\n` +
-      `🏆 *TP2:* $${fmt(result.takeProfit2)} _(${pct(result.entry, result.takeProfit2)})_\n` +
-      `📊 *R:R:* 1:${result.riskReward.toFixed(1)}\n`;
+      `🛑 *Stop Loss:* $${fmt(result.stopLoss)} _(${riskPct})_\n` +
+      `🎯 *TP1:* $${fmt(result.takeProfit1)} _(${tp1Pct})_\n` +
+      `🏆 *TP2:* $${fmt(result.takeProfit2)} _(${tp2Pct})_\n` +
+      `📊 *R:R:* 1 : ${result.riskReward.toFixed(1)}\n`;
 
-    if (capital !== null && capital > 0 && result.entry > 0) {
-      const slDistance = Math.abs(result.entry - result.stopLoss) / result.entry;
-      if (slDistance > 0) {
-        const riskAmount  = capital * 0.02;
-        const rawPosition = riskAmount / slDistance;
-        const position    = Math.min(rawPosition, capital);
-        positionLine = `💼 *Position:* $${fmt(position)} _(2% Risiko)_\n`;
-      }
+    if (capital !== null && capital > 0 && result.entry > 0 && slDist > 0) {
+      const slDistPct  = slDist / result.entry;
+      const riskAmount = capital * 0.02;
+      const position   = Math.min(riskAmount / slDistPct, capital);
+      const slLoss     = position * slDistPct;
+      const tp1Gain    = position * Math.abs(result.takeProfit1 - result.entry) / result.entry;
+      const tp2Gain    = position * Math.abs(result.takeProfit2 - result.entry) / result.entry;
+
+      positionLine = `💼 *Position:* $${fmtMoney(position)} _(2% Risiko von $${fmtMoney(capital)})_\n`;
+      moneyLines   =
+        `\n💵 *In Euro/Dollar:*\n` +
+        `  ❌ Max. Verlust: -$${fmtMoney(slLoss)}\n` +
+        `  ✅ Gewinn TP1: +$${fmtMoney(tp1Gain)}\n` +
+        `  🏆 Gewinn TP2: +$${fmtMoney(tp2Gain)}\n`;
     }
   }
 
   return (
-    `⚡ *Signal Alert — ${result.symbol}*\n\n` +
-    `${dir}\n` +
+    `⚡ *Signal — ${result.symbol}* · 4h · ${nowUTC()}\n\n` +
+    `${dirLine}\n` +
     `💰 *Preis:* $${fmt(result.price)}\n` +
     tradeLevels +
     positionLine +
-    `\n*Signale:*\n${allSignals}\n\n` +
-    `_Technische Analyse — kein Finanzrat._`
+    moneyLines +
+    `\n📈 *Signale:*\n${allSignals}\n\n` +
+    `${tradeLinks(result.symbol)}\n\n` +
+    `_⚠️ Kein Finanzrat. Auf eigenes Risiko._`
   );
 }
 
-function buildExitMessage(trade: ActiveTrade, reason: 'sl' | 'tp1' | 'tp2', currentPrice: number): string {
-  const durationH = Math.round((Date.now() - trade.openTime) / 1000 / 60 / 60);
-  const profitPct = pct(trade.entry, currentPrice);
+function buildExitMessage(
+  trade: ActiveTrade,
+  reason: 'sl' | 'tp1' | 'tp2',
+  currentPrice: number,
+): string {
+  const durationH  = Math.round((Date.now() - trade.openTime) / 1000 / 60 / 60);
+  const profitPct  = pct(trade.entry, currentPrice);
+  const links      = tradeLinks(trade.symbol);
+  const priceStr   = `$${fmt(currentPrice)} _(${profitPct})_`;
 
   if (reason === 'sl') {
     return (
       `🛑 *GEH RAUS — ${trade.symbol}*\n\n` +
-      `❌ Stop Loss erreicht!\n` +
-      `💰 *Preis:* $${fmt(currentPrice)} _(${profitPct})_\n` +
-      `⏱ Trade lief: ${durationH}h\n\n` +
+      `❌ *Stop Loss getroffen!*\n\n` +
+      `💰 *Ausstiegspreis:* ${priceStr}\n` +
+      `📍 *Entry war:* $${fmt(trade.entry)}\n` +
+      `⏱ *Trade lief:* ${durationH}h\n` +
+      `📊 *Ergebnis:* -1R _(Max. Verlust begrenzt)_\n\n` +
+      `👉 Position schließen und Verlust realisieren.\n\n` +
+      `${links}\n\n` +
       `_Verlust begrenzt — nächste Chance kommt._`
     );
   }
+
   if (reason === 'tp1') {
     return (
       `🎯 *GEH RAUS (halb) — ${trade.symbol}*\n\n` +
-      `✅ TP1 erreicht! Gewinne sichern!\n` +
-      `💰 *Preis:* $${fmt(currentPrice)} _(${profitPct})_\n` +
-      `⏱ Trade lief: ${durationH}h\n\n` +
-      `_Tipp: Nimm die Hälfte raus, Rest läuft auf TP2 ($${fmt(trade.tp2)})_`
+      `✅ *TP1 erreicht! Gewinne sichern!*\n\n` +
+      `💰 *Ausstiegspreis:* ${priceStr}\n` +
+      `📍 *Entry war:* $${fmt(trade.entry)}\n` +
+      `⏱ *Trade lief:* ${durationH}h\n` +
+      `📊 *Ergebnis:* +1.5R erreicht\n\n` +
+      `👉 Hälfte der Position schließen.\n` +
+      `👉 Rest läuft weiter bis TP2 ($${fmt(trade.tp2)}).\n` +
+      `👉 Stop Loss auf Entry ziehen (Break-even).\n\n` +
+      `${links}\n\n` +
+      `_Gewinne gesichert — Rest läuft risikofrei._`
     );
   }
+
   return (
     `🏆 *GEH RAUS (alles) — ${trade.symbol}*\n\n` +
-    `✅ TP2 erreicht — voller Gewinn!\n` +
-    `💰 *Preis:* $${fmt(currentPrice)} _(${profitPct})_\n` +
-    `⏱ Trade lief: ${durationH}h\n\n` +
-    `_Top Trade! Alles raus und Gewinne sichern._`
+    `✅ *TP2 erreicht — Voller Gewinn!*\n\n` +
+    `💰 *Ausstiegspreis:* ${priceStr}\n` +
+    `📍 *Entry war:* $${fmt(trade.entry)}\n` +
+    `⏱ *Trade lief:* ${durationH}h\n` +
+    `📊 *Ergebnis:* +3R erreicht 🔥\n\n` +
+    `👉 Gesamte Position schließen und Gewinn mitnehmen.\n\n` +
+    `${links}\n\n` +
+    `_Perfekter Trade. Alles raus._`
   );
 }
 
@@ -229,12 +288,10 @@ async function runAnalysis(): Promise<void> {
 
   const watched = await getAllWatchedSymbols();
 
-  // Merge user watchlist with channel symbols (deduplicated)
   const symbolMap = new Map<string, string[]>();
   for (const { symbol, user_ids } of watched) {
     symbolMap.set(symbol, user_ids);
   }
-  // Channel symbols always analyzed even if no user watches them
   if (CHANNEL_ID) {
     for (const sym of CHANNEL_SYMBOLS) {
       if (!symbolMap.has(sym)) symbolMap.set(sym, []);
@@ -251,7 +308,6 @@ async function runAnalysis(): Promise<void> {
       const candles = await getCandles(symbol, '4h', 100);
       const isChannelSymbol = CHANNEL_ID !== null && CHANNEL_SYMBOLS.includes(symbol);
 
-      // 1. Check active trade
       const activeTrade = activeTrades.get(symbol);
       if (activeTrade) {
         await checkActiveTrade(activeTrade, candles);
@@ -259,7 +315,6 @@ async function runAnalysis(): Promise<void> {
 
       if (activeTrades.has(symbol)) continue;
 
-      // 2. Look for new signal
       const result: AnalysisResult = analyzeCandles(symbol, candles);
       if (!isNotifiableSignal(result)) continue;
 
@@ -273,8 +328,13 @@ async function runAnalysis(): Promise<void> {
 
       const users = user_ids.length > 0 ? await getUsersForAlert(user_ids) : [];
 
-      // Register active trade
-      if (result.entry !== null && result.stopLoss !== null && result.takeProfit1 !== null && result.takeProfit2 !== null && result.direction !== null) {
+      if (
+        result.entry !== null &&
+        result.stopLoss !== null &&
+        result.takeProfit1 !== null &&
+        result.takeProfit2 !== null &&
+        result.direction !== null
+      ) {
         activeTrades.set(symbol, {
           symbol,
           direction:     result.direction,
@@ -286,20 +346,23 @@ async function runAnalysis(): Promise<void> {
           openTime:      Date.now(),
           tp1Hit:        false,
           postToChannel: isChannelSymbol,
+          positionSize:  null,
         });
         console.log(`[worker] Active trade opened: ${symbol} ${result.direction}`);
       }
 
-      // Send to individual users
       for (const { telegram_id, capital } of users) {
         try {
-          await bot.api.sendMessage(telegram_id, buildEntryMessage(result, capital), { parse_mode: 'Markdown' });
+          await bot.api.sendMessage(
+            telegram_id,
+            buildEntryMessage(result, capital),
+            { parse_mode: 'Markdown' },
+          );
         } catch (e) {
           console.error(`[worker] sendMessage to ${telegram_id} failed:`, (e as Error).message);
         }
       }
 
-      // Send to channel (no position sizing)
       if (isChannelSymbol) {
         await sendToChannel(buildEntryMessage(result, null));
       }
@@ -322,10 +385,10 @@ async function runNewsPipeline(): Promise<void> {
     ]);
     const items = [
       ...(cryptoNews.status === 'fulfilled' ? cryptoNews.value : []),
-      ...(macroNews.status === 'fulfilled' ? macroNews.value : []),
+      ...(macroNews.status  === 'fulfilled' ? macroNews.value  : []),
     ];
     if (cryptoNews.status === 'rejected') console.error('[worker] CryptoPanic failed:', cryptoNews.reason);
-    if (macroNews.status === 'rejected')  console.error('[worker] NewsAPI/Claude failed:', macroNews.reason);
+    if (macroNews.status  === 'rejected') console.error('[worker] NewsAPI/Claude failed:', macroNews.reason);
     await upsertNewsItems(items);
     console.log(`[worker] News cache updated with ${items.length} items.`);
   } catch (e) {
