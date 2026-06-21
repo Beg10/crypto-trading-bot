@@ -35,7 +35,11 @@ const INTERVAL_MS = (parseInt(process.env.WORKER_INTERVAL_MINUTES ?? '5', 10)) *
 
 // ─── Channel config ───────────────────────────────────────────────────────────
 const CHANNEL_ID: string | null = process.env.CHANNEL_ID ?? null;
-const CHANNEL_SYMBOLS = ['ETHUSDT', 'SOLUSDT', 'BNBUSDT'];
+const CHANNEL_SYMBOLS = [
+  'BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT',
+  'ADAUSDT', 'DOGEUSDT', 'AVAXUSDT', 'DOTUSDT', 'LINKUSDT',
+  'UNIUSDT', 'LTCUSDT', 'ATOMUSDT', 'NEARUSDT', 'MATICUSDT',
+];
 
 // ─── Daily recap tracking ────────────────────────────────────────────────────
 let lastRecapDate = '';
@@ -325,20 +329,45 @@ async function runAnalysis(): Promise<void> {
 
   for (const [symbol, user_ids] of symbolMap) {
     try {
-      const candles = await getCandles(symbol, '4h', 100);
+      const [candles4h, candles1h] = await Promise.all([
+        getCandles(symbol, '4h', 100),
+        getCandles(symbol, '1h', 100),
+      ]);
       const isChannelSymbol = CHANNEL_ID !== null && CHANNEL_SYMBOLS.includes(symbol);
 
-      // 1. Check active trade first
+      // 1. Check active trade first (uses 4h candles for price action)
       const activeTrade = activeTrades.get(symbol);
       if (activeTrade) {
-        await checkActiveTrade(activeTrade, candles);
+        await checkActiveTrade(activeTrade, candles4h);
       }
 
       if (activeTrades.has(symbol)) continue;
 
-      // 2. Look for new signal
-      const result: AnalysisResult = analyzeCandles(symbol, candles);
-      if (!isNotifiableSignal(result)) continue;
+      // 2. Multi-timeframe analysis: 4h is primary, 1h must confirm
+      const result4h: AnalysisResult = analyzeCandles(symbol, candles4h);
+      const result1h: AnalysisResult = analyzeCandles(symbol, candles1h);
+
+      // Both timeframes must agree on direction
+      if (!isNotifiableSignal(result4h)) continue;
+      if (result1h.direction === null || result1h.direction !== result4h.direction) {
+        console.log(`[worker] ${symbol} skipped — 1h (${result1h.direction ?? 'none'}) vs 4h (${result4h.direction}) mismatch`);
+        continue;
+      }
+
+      // Merge: use 4h trade levels, add 1h confirmation note to signals
+      const result: AnalysisResult = {
+        ...result4h,
+        signals: [
+          ...result4h.signals,
+          `1h Bestaetigung: ${result1h.direction === 'bullish' ? 'bullisch' : 'baerisch'} (Score ${
+            result1h.signals.filter(s =>
+              s.includes('RSI') || s.includes('MACD') || s.includes('Bollinger') ||
+              s.includes('StochRSI') || s.includes('Divergenz') ||
+              ['Hammer','Bullish Engulfing','Shooting Star','Bearish Engulfing','Morning Star','Bullish Marubozu','Bearish Marubozu','Doji'].some(p => s.includes(p))
+            ).length
+          } Indikatoren) ✅`,
+        ],
+      };
 
       const lastTime = lastAlertTime.get(symbol) ?? 0;
       if (Date.now() - lastTime < ALERT_COOLDOWN_MS) {
