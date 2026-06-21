@@ -121,8 +121,8 @@ async function sendToChannel(message: string): Promise<void> {
 function buildEntryMessage(result: AnalysisResult, capital: number | null = null): string {
   const isBull = result.direction === 'bullish';
   const dirLine = isBull
-    ? '🟢 *GEH REIN* — Long Position eröffnen'
-    : '⚠️ *FINGER WEG* — Bärisches Signal, kein Trade';
+    ? '🟢 *GEH REIN LONG* — Long Position eröffnen'
+    : '🔴 *GEH REIN SHORT* — Short Position eröffnen';
 
   const allSignals = result.signals.map((s) => `  • ${s}`).join('\n');
 
