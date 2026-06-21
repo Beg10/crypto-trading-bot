@@ -267,3 +267,14 @@ export async function getAllUsers(): Promise<Array<{ telegram_id: number }>> {
   if (error) throw new Error(`DB getAllUsers: ${error.message}`);
   return (data ?? []) as Array<{ telegram_id: number }>;
 }
+
+export async function getWeeklySignals(): Promise<SignalLogEntry[]> {
+  const since = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+  const { data, error } = await supabase
+    .from('signal_log')
+    .select('*')
+    .gte('opened_at', since)
+    .order('opened_at', { ascending: true });
+  if (error) throw new Error(`DB getWeeklySignals: ${error.message}`);
+  return (data ?? []) as SignalLogEntry[];
+}

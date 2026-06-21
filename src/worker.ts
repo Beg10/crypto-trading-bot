@@ -25,6 +25,8 @@ import { fetchCryptoPanicNews } from './services/cryptopanic';
 import { fetchAndAnalyzeMacroNews } from './services/news';
 import { AnalysisResult } from './types';
 import { sendDailyRecap } from './commands/recap';
+import { sendWeeklyReport } from './commands/weeklyReport';
+import { getWeeklySignals } from './db';
 
 if (!process.env.BOT_TOKEN) {
   throw new Error('BOT_TOKEN environment variable is not set');
@@ -43,6 +45,7 @@ const CHANNEL_SYMBOLS = [
 
 // ─── Daily recap tracking ────────────────────────────────────────────────────
 let lastRecapDate = '';
+let lastWeeklyDate = '';
 
 // ─── Signal deduplication ─────────────────────────────────────────────────────
 const lastAlertTime = new Map<string, number>();
