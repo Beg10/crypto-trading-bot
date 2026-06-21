@@ -3,6 +3,7 @@ import {
   MACD,
   BollingerBands,
   ATR,
+  EMA,
 } from 'technicalindicators';
 import { Candle, AnalysisResult } from '../types';
 
@@ -65,6 +66,28 @@ function calcBBSignal(closes: number[], period = 20): BBSignal {
   if (price <= last.lower) return 'oversold';
   if (price >= last.upper) return 'overbought';
   return null;
+}
+
+// ─── EMA Trend Filter ─────────────────────────────────────────────────────────
+
+function calcEMA50(closes: number[]): number | null {
+  if (closes.length < 50) return null;
+  const values = EMA.calculate({ values: closes, period: 50 });
+  return values.length > 0 ? values[values.length - 1] : null;
+}
+
+// ─── Volume Filter ────────────────────────────────────────────────────────────
+
+/**
+ * Returns ratio of current candle volume vs 20-candle average.
+ * e.g. 1.5 = 50% above average = good confirmation.
+ */
+function calcVolumeRatio(candles: Candle[], period = 20): number | null {
+  if (candles.length < period + 1) return null;
+  const pastVols = candles.slice(-period - 1, -1).map((c) => c.volume);
+  const avgVol   = pastVols.reduce((a, b) => a + b, 0) / pastVols.length;
+  const curVol   = candles[candles.length - 1].volume;
+  return avgVol > 0 ? curVol / avgVol : null;
 }
 
 // ─── Candlestick Patterns ─────────────────────────────────────────────────────
@@ -135,7 +158,6 @@ interface TradeLevels {
 
 function calcTradeLevels(candles: Candle[], direction: 'bullish' | 'bearish'): TradeLevels {
   const price = candles[candles.length - 1].close;
-  // FIX 1: ATR×2 (was ×1.5) — gives trades more room to breathe past normal noise
   const atr   = calcATR(candles) ?? price * 0.02;
 
   if (direction === 'bullish') {
@@ -167,10 +189,20 @@ export function analyzeCandles(symbol: string, candles: Candle[]): AnalysisResul
   const closes = candles.map((c) => c.close);
   const price  = closes[closes.length - 1] ?? 0;
 
-  const rsi       = calcRSI(closes);
+  const rsi        = calcRSI(closes);
   const macdSignal = calcMACDSignal(closes);
-  const bbSignal  = calcBBSignal(closes);
-  const patterns  = detectPatterns(candles);
+  const bbSignal   = calcBBSignal(closes);
+  const patterns   = detectPatterns(candles);
+  const ema50      = calcEMA50(closes);
+  const volumeRatio = calcVolumeRatio(candles);
+
+  // ── Trend & volume filters ───────────────────────────────────────────────────
+  // Only allow bullish signals when price is above EMA50 (uptrend confirmed)
+  // Only allow bearish signals when price is below EMA50 (downtrend confirmed)
+  const trendAllowsBull = ema50 === null || price > ema50;
+  const trendAllowsBear = ema50 === null || price < ema50;
+  // Require at least average volume (ratio >= 1.0) for signal confirmation
+  const volumeOk = volumeRatio === null || volumeRatio >= 1.0;
 
   const signals: string[] = [];
 
@@ -180,9 +212,17 @@ export function analyzeCandles(symbol: string, candles: Candle[]): AnalysisResul
   }
   if (macdSignal === 'bullish_cross') signals.push('MACD Bullish Cross');
   if (macdSignal === 'bearish_cross') signals.push('MACD Bearish Cross');
-  if (bbSignal === 'oversold')  signals.push('Below Lower Bollinger Band');
+  if (bbSignal === 'oversold')   signals.push('Below Lower Bollinger Band');
   if (bbSignal === 'overbought') signals.push('Above Upper Bollinger Band');
   signals.push(...patterns);
+
+  // Info signals (not scored, just informational)
+  if (ema50 !== null) {
+    signals.push(`EMA50: $${ema50.toFixed(2)} — Trend ${price > ema50 ? '↗ bullisch' : '↘ bärisch'}`);
+  }
+  if (volumeRatio !== null) {
+    signals.push(`Volumen: ${volumeRatio.toFixed(2)}x Ø ${volumeRatio >= 1.0 ? '✅' : '⚠️ niedrig'}`);
+  }
 
   const bullishPatterns = ['Bullish Engulfing', 'Hammer', 'Morning Star', 'Bullish Marubozu'];
   const bearishPatterns = ['Bearish Engulfing', 'Shooting Star', 'Bearish Marubozu'];
@@ -206,9 +246,16 @@ export function analyzeCandles(symbol: string, candles: Candle[]): AnalysisResul
   let takeProfit2: number | null = null;
   let riskReward:  number | null = null;
 
-  // FIX 2: Score ≥ 2 (was ≥ 2) — only fire when 3+ indicators agree
-  if (bullishScore >= 2 || bearishScore >= 2) {
-    direction = bullishScore >= bearishScore ? 'bullish' : 'bearish';
+  const isBullish = bullishScore >= 2 && trendAllowsBull && volumeOk;
+  const isBearish = bearishScore >= 2 && trendAllowsBear && volumeOk;
+
+  if (isBullish || isBearish) {
+    direction = isBullish && bullishScore >= bearishScore ? 'bullish' : 'bearish';
+    if (direction === 'bullish' && !isBullish) direction = null;
+    if (direction === 'bearish' && !isBearish) direction = null;
+  }
+
+  if (direction !== null) {
     const levels = calcTradeLevels(candles, direction);
     entry       = levels.entry;
     stopLoss    = levels.stopLoss;
@@ -217,25 +264,15 @@ export function analyzeCandles(symbol: string, candles: Candle[]): AnalysisResul
     riskReward  = levels.riskReward;
   }
 
-  return { symbol, price, rsi, macdSignal, bbSignal, patterns, signals, direction, entry, stopLoss, takeProfit1, takeProfit2, riskReward };
+  return {
+    symbol, price, rsi, macdSignal, bbSignal, patterns, signals,
+    direction, entry, stopLoss, takeProfit1, takeProfit2, riskReward,
+    ema50, volumeRatio,
+  };
 }
 
 export function isNotifiableSignal(result: AnalysisResult): boolean {
-  const bullishPatterns = ['Bullish Engulfing', 'Hammer', 'Morning Star', 'Bullish Marubozu'];
-  const bearishPatterns = ['Bearish Engulfing', 'Shooting Star', 'Bearish Marubozu'];
-
-  const rsiBullish  = result.rsi !== null && result.rsi < 30;
-  const rsiBearish  = result.rsi !== null && result.rsi > 70;
-  const macdBullish = result.macdSignal === 'bullish_cross';
-  const macdBearish = result.macdSignal === 'bearish_cross';
-  const bbBullish   = result.bbSignal === 'oversold';
-  const bbBearish   = result.bbSignal === 'overbought';
-  const hasBullishPattern = result.patterns.some((p) => bullishPatterns.includes(p));
-  const hasBearishPattern = result.patterns.some((p) => bearishPatterns.includes(p));
-
-  const bullishScore = (rsiBullish ? 1 : 0) + (macdBullish ? 1 : 0) + (bbBullish ? 1 : 0) + (hasBullishPattern ? 1 : 0);
-  const bearishScore = (rsiBearish ? 1 : 0) + (macdBearish ? 1 : 0) + (bbBearish ? 1 : 0) + (hasBearishPattern ? 1 : 0);
-
-  // FIX 2: Score ≥ 2
-  return bullishScore >= 2 || bearishScore >= 2;
+  return result.direction !== null &&
+    result.entry !== null &&
+    result.stopLoss !== null;
 }

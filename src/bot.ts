@@ -8,6 +8,7 @@ import { handleList } from './commands/list';
 import { handleNews } from './commands/news';
 import { handleMarket } from './commands/market';
 import { handleCapital } from './commands/capital';
+import { handleStatus } from './commands/status';
 
 if (!process.env.BOT_TOKEN) {
   throw new Error('BOT_TOKEN environment variable is not set');
@@ -36,6 +37,7 @@ bot.command('list', handleList);
 bot.command('news', handleNews);
 bot.command('market', handleMarket);
 bot.command('capital', handleCapital);
+bot.command('status', handleStatus);
 
 // Returns the user's Telegram chat ID — needed once to set ADMIN_CHAT_ID
 bot.command('myid', async (ctx) => {

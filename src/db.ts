@@ -156,3 +156,85 @@ export async function getRecentNews(limitHours = 24): Promise<NewsItem[]> {
   if (error) throw new Error(`DB getRecentNews: ${error.message}`);
   return (data ?? []) as NewsItem[];
 }
+
+// ─── Signal Log ───────────────────────────────────────────────────────────────────────────────
+
+export interface SignalLogEntry {
+  id: string;
+  symbol: string;
+  direction: string;
+  entry: number;
+  stop_loss: number;
+  take_profit1: number;
+  take_profit2: number;
+  risk_reward: number | null;
+  signals: string[];
+  ema50: number | null;
+  volume_ratio: number | null;
+  opened_at: string;
+  closed_at: string | null;
+  close_reason: string | null;
+  close_price: number | null;
+  result_r: number | null;
+}
+
+export async function logSignal(data: {
+  symbol: string;
+  direction: string;
+  entry: number;
+  stop_loss: number;
+  take_profit1: number;
+  take_profit2: number;
+  risk_reward: number | null;
+  signals: string[];
+  ema50: number | null;
+  volume_ratio: number | null;
+}): Promise<string> {
+  const { data: row, error } = await supabase
+    .from('signal_log')
+    .insert(data)
+    .select('id')
+    .single();
+  if (error) throw new Error(`DB logSignal: ${error.message}`);
+  return row.id as string;
+}
+
+export async function closeSignal(
+  id: string,
+  closeReason: 'sl' | 'tp1' | 'tp2',
+  closePrice: number,
+  resultR: number,
+): Promise<void> {
+  const { error } = await supabase
+    .from('signal_log')
+    .update({
+      closed_at: new Date().toISOString(),
+      close_reason: closeReason,
+      close_price: closePrice,
+      result_r: resultR,
+    })
+    .eq('id', id);
+  if (error) throw new Error(`DB closeSignal: ${error.message}`);
+}
+
+export async function getActiveSignals(): Promise<SignalLogEntry[]> {
+  const { data, error } = await supabase
+    .from('signal_log')
+    .select('*')
+    .is('closed_at', null)
+    .order('opened_at', { ascending: false });
+  if (error) throw new Error(`DB getActiveSignals: ${error.message}`);
+  return (data ?? []) as SignalLogEntry[];
+}
+
+export async function getRecentSignals(limitDays = 30): Promise<SignalLogEntry[]> {
+  const since = new Date(Date.now() - limitDays * 24 * 60 * 60 * 1000).toISOString();
+  const { data, error } = await supabase
+    .from('signal_log')
+    .select('*')
+    .gte('opened_at', since)
+    .not('closed_at', 'is', null)
+    .order('opened_at', { ascending: false });
+  if (error) throw new Error(`DB getRecentSignals: ${error.message}`);
+  return (data ?? []) as SignalLogEntry[];
+}

@@ -36,7 +36,6 @@ export interface NewsItem {
   published_at: string;
 }
 
-// Binance REST kline/candlestick
 export interface Candle {
   openTime: number;
   open: number;
@@ -55,13 +54,14 @@ export interface AnalysisResult {
   bbSignal: 'oversold' | 'overbought' | null;
   patterns: string[];
   signals: string[];
-  // Trade levels
   direction: 'bullish' | 'bearish' | null;
   entry: number | null;
   stopLoss: number | null;
   takeProfit1: number | null;
   takeProfit2: number | null;
   riskReward: number | null;
+  ema50: number | null;
+  volumeRatio: number | null;
 }
 
 export interface CoinMarketData {
