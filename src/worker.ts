@@ -148,18 +148,10 @@ async function tick(): Promise<void> {
   await Promise.allSettled([runAnalysis(), runNewsPipeline()]);
 }
 
-async function main(): Promise<void> {
-  console.log(`[worker] Starting — interval: ${INTERVAL_MS / 60000} min`);
+// ─── Admin notification ───────────────────────────────────────────────────────
 
-  // Run immediately on start, then on interval
-  await tick();
-
-  setInterval(() => {
-    tick().catch((e) => console.error('[worker] Unhandled tick error:', e));
-  }, INTERVAL_MS);
-}
-
-main().catch((e) => {
-  console.error('[worker] Fatal error:', e);
-  process.exit(1);
-});
+async function notifyAdmin(message: string): Promise<void> {
+  const adminId = process.env.ADMIN_CHAT_ID;
+  if (!adminId) return;
+  try {
+    await bot.api.sendMessage(adminId, message, { parse_
