@@ -14,7 +14,7 @@ if (!process.env.BOT_TOKEN) {
 
 export const bot = new Bot(process.env.BOT_TOKEN);
 
-// ─── Monitoring helper ────────────────────────────────────────────────────────
+// ─── Monitoring helper ────────────────────────────────────────────────
 
 async function notifyAdmin(message: string): Promise<void> {
   const adminId = process.env.ADMIN_CHAT_ID;
@@ -26,7 +26,7 @@ async function notifyAdmin(message: string): Promise<void> {
   }
 }
 
-// ─── Commands ─────────────────────────────────────────────────────────────────
+// ─── Commands ─────────────────────────────────────────────────────────────────────────────────
 
 bot.command('start', handleStart);
 bot.command('watch', handleWatch);
@@ -43,18 +43,15 @@ bot.command('myid', async (ctx) => {
 // Unknown commands
 bot.on('message:text', async (ctx) => {
   if (ctx.message.text.startsWith('/')) {
-    await ctx.reply(
-      'Unknown command. Use /start to see available commands.',
-    );
+    await ctx.reply('Unknown command. Use /start to see available commands.');
   }
 });
 
-// ─── Error handling ───────────────────────────────────────────────────────────
+// ─── Error handling ───────────────────────────────────────────────────────────────────────────
 
 bot.catch((err) => {
   const ctx = err.ctx;
   console.error(`Error handling update ${ctx.update.update_id}:`);
-
   if (err.error instanceof GrammyError) {
     console.error('grammY error:', err.error.description);
   } else if (err.error instanceof HttpError) {
@@ -64,7 +61,7 @@ bot.catch((err) => {
   }
 });
 
-// ─── Crash monitoring ─────────────────────────────────────────────────────────
+// ─── Crash monitoring ──────────────────────────────────────────────────────────────────────────
 
 process.on('uncaughtException', async (err) => {
   console.error('[bot] Uncaught exception:', err);
@@ -72,16 +69,22 @@ process.on('uncaughtException', async (err) => {
   process.exit(1);
 });
 
-process.on('unhandledRejection', async (reason) => {
-  console.error('[bot] Unhandled rejection:', reason);
-  await notifyAdmin(`🔴 *Bot unhandled rejection!*\n\`${String(reason)}\`\n\nRailway wird neu starten…`);
-});
+// ─── Start ───────────────────────────────────────────────────────────────────────────────────
 
-// ─── Start ─────────────────────────────────────────────────────────────────────
-
-bot.start({
-  onStart: async (info) => {
-    console.log(`Bot started as @${info.username}`);
-    await notifyAdmin(`🟢 *Bot gestartet!*\n@${info.username} ist online.\n_${new Date().toISOString()}_`);
-  },
-});
+bot
+  .start({
+    onStart: async (info) => {
+      console.log(`Bot started as @${info.username}`);
+      await notifyAdmin(`🟢 *Bot gestartet!*\n@${info.username} ist online.\n_${new Date().toISOString()}_`);
+    },
+  })
+  .catch(async (e) => {
+    // 409 = another instance already polling (Railway deploy overlap)
+    if (e instanceof GrammyError && e.error_code === 409) {
+      console.log('[bot] 409 conflict — old instance still running, restarting…');
+      process.exit(1); // Railway restarts immediately, conflict resolves itself
+    }
+    console.error('[bot] bot.start() fatal error:', e);
+    await notifyAdmin(`🔴 *Bot fatal error!*\n\`${(e as Error).message}\``);
+    process.exit(1);
+  });
