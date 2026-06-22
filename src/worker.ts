@@ -1,12 +1,12 @@
 /**
  * Background worker — runs independently of the Telegram bot process.
  * Every WORKER_INTERVAL_MINUTES it:
- *   1. Fetches candles for all watched symbols + channel symbols
- *   2. Runs technical analysis → sends GEH REIN to users + channel
- *   3. Checks active trades → sends GEH RAUS when SL or TP is hit
+ *   1. Fetches candles for all watched + channel symbols
+ *   2. Runs technical analysis → sends signal to users + channel
+ *   3. Checks active trades → sends exit when SL or TP is hit
  *   4. Auto break-even: moves SL to entry after TP1 hit
  *   5. Logs every signal + outcome to Supabase signal_log
- *   6. Refreshes the news cache
+ *   6. Sends personalized $ P&L to users who used /in
  */
 
 import 'dotenv/config';
@@ -19,6 +19,8 @@ import {
   logSignal,
   closeSignal,
   getActiveSignals,
+  getUsersInPosition,
+  closeUserPositions,
 } from './db';
 import { getCandles } from './services/binance';
 import { analyzeCandles, isNotifiableSignal } from './services/analysis';
@@ -28,6 +30,7 @@ import { AnalysisResult } from './types';
 import { sendDailyRecap } from './commands/recap';
 import { sendWeeklyReport } from './commands/weeklyReport';
 import { getWeeklySignals } from './db';
+import { buildMorningBriefing } from './commands/morningBriefing';
 
 if (!process.env.BOT_TOKEN) {
   throw new Error('BOT_TOKEN environment variable is not set');
@@ -38,18 +41,13 @@ const INTERVAL_MS = (parseInt(process.env.WORKER_INTERVAL_MINUTES ?? '5', 10)) *
 
 // ─── Channel config ───────────────────────────────────────────────────────────
 const CHANNEL_ID: string | null = process.env.CHANNEL_ID ?? null;
-// Best performing coins from backtest analysis (EMA cross strategy)
-// BTC is master filter only — not traded as signal (weak backtest)
 const CHANNEL_SYMBOLS = ['ETHUSDT', 'XRPUSDT', 'LTCUSDT', 'BNBUSDT', 'ATOMUSDT', 'SOLUSDT'];
 
-// ─── Daily recap tracking ────────────────────────────────────────────────────
-let lastRecapDate = '';
-let lastWeeklyDate = '';
-
-// ─── BTC Macro Shift tracking ─────────────────────────────────────────────────
+// ─── Tracking ────────────────────────────────────────────────────────────────
+let lastRecapDate    = '';
+let lastWeeklyDate   = '';
+let lastBriefingDate = '';
 let lastBtcMacro: 'bullish' | 'bearish' | null = null;
-
-// ─── Signal deduplication ─────────────────────────────────────────────────────
 const lastAlertTime = new Map<string, number>();
 const ALERT_COOLDOWN_MS = 60 * 60 * 1000;
 
@@ -59,15 +57,18 @@ interface ActiveTrade {
   symbol:        string;
   direction:     'bullish' | 'bearish';
   entry:         number;
-  sl:            number;            // current SL (moves to entry after TP1)
-  originalSl:    number;            // original SL for logging
+  sl:            number;
+  originalSl:    number;
   tp1:           number;
   tp2:           number;
+  tp3:           number;
+  tp4:           number;
+  risk:          number;   // absolute risk per unit
   users:         Array<{ telegram_id: number; capital: number | null }>;
   openTime:      number;
   tp1Hit:        boolean;
   postToChannel: boolean;
-  signalLogId:   string | null;     // Supabase signal_log id
+  signalLogId:   string | null;
 }
 
 const activeTrades = new Map<string, ActiveTrade>();
@@ -97,8 +98,6 @@ function nowUTC(): string {
   }) + ' UTC';
 }
 
-// ─── Trade links ─────────────────────────────────────────────────────────────
-
 function tradeLinks(symbol: string): string {
   const base  = symbol.replace(/USDT$|BUSD$/, '');
   const quote = symbol.includes('USDT') ? 'USDT' : 'BUSD';
@@ -107,7 +106,206 @@ function tradeLinks(symbol: string): string {
   return `[📊 Chart](${tv}) · [🏦 Binance](${bnb})`;
 }
 
-// ─── Channel helper ───────────────────────────────────────────────────────────
+// ─── L/S Ratio ────────────────────────────────────────────────────────────────
+
+async function fetchLsRatio(symbol: string): Promise<number | null> {
+  try {
+    const url = `https://fapi.binance.com/futures/data/globalLongShortAccountRatio?symbol=${symbol}&period=1h&limit=1`;
+    const res  = await fetch(url, { signal: AbortSignal.timeout(5000) });
+    if (!res.ok) return null;
+    const data = await res.json() as Array<{ longShortRatio: string }>;
+    if (Array.isArray(data) && data.length > 0) {
+      return parseFloat(data[0].longShortRatio);
+    }
+  } catch { /* ignore — not all symbols have futures data */ }
+  return null;
+}
+
+function lsRatioLabel(ratio: number): string {
+  if (ratio >= 2.0) return '🐂 Stark bullisch';
+  if (ratio >= 1.3) return '📈 Mehr Longs';
+  if (ratio >= 0.8) return '⚖️ Ausgeglichen';
+  if (ratio >= 0.5) return '📉 Mehr Shorts';
+  return '🐻 Stark bärisch';
+}
+
+// ─── Message builders ─────────────────────────────────────────────────────────
+
+function buildEntryMessage(
+  result: AnalysisResult,
+  capital: number | null = null,
+  lsRatio: number | null = null,
+): string {
+  const isBull = result.direction === 'bullish';
+  const emoji  = isBull ? '🟢' : '🔴';
+  const dir    = isBull ? 'LONG' : 'SHORT';
+
+  // ── TP levels (4x) ──────────────────────────────────────────────────────────
+  let tpSection  = '';
+  let exampleSection = '';
+
+  if (
+    result.entry    !== null &&
+    result.stopLoss !== null &&
+    result.takeProfit1 !== null &&
+    result.takeProfit2 !== null
+  ) {
+    const e    = result.entry;
+    const sl   = result.stopLoss;
+    const risk = Math.abs(e - sl);
+
+    const tp1 = result.takeProfit1;         // 2R
+    const tp2 = result.takeProfit2;         // 4R
+    const tp3 = isBull ? e + risk * 6 : e - risk * 6;  // 6R
+    const tp4 = isBull ? e + risk * 8 : e - risk * 8;  // 8R
+
+    const slDist = Math.abs(e - sl) / e;
+    const rr1 = Math.abs(tp1 - e) / risk;
+    const rr2 = Math.abs(tp2 - e) / risk;
+
+    tpSection =
+      `\n💰 *Entry:* \`$${fmt(e)}\`\n` +
+      `🛑 *Stop Loss:* \`$${fmt(sl)}\` _(${pct(e, sl)})_\n` +
+      `${'─'.repeat(30)}\n` +
+      `🎯 *TP1:* \`$${fmt(tp1)}\` _(R/R ${rr1.toFixed(1)} · ${pct(e, tp1)})_ — 50% raus\n` +
+      `🎯 *TP2:* \`$${fmt(tp2)}\` _(R/R ${rr2.toFixed(1)} · ${pct(e, tp2)})_ — Rest raus\n` +
+      `🚀 *TP3:* \`$${fmt(tp3)}\` _(R/R 6.0 · ${pct(e, tp3)})_ extended\n` +
+      `🌕 *TP4:* \`$${fmt(tp4)}\` _(R/R 8.0 · ${pct(e, tp4)})_ moon shot\n`;
+
+    // ── $ example ($100, 10x) ────────────────────────────────────────────────
+    const defMargin = capital ?? 100;
+    const defLev    = 10;
+    const position  = defMargin * defLev;
+    const slLoss    = position * slDist;
+    const tp1Gain   = position * slDist * 2;   // 2R
+    const tp2Gain   = position * slDist * 4;   // 4R
+    const tp1Pct    = slDist * defLev * 200;   // 2R × leverage × 100%
+    const tp2Pct    = slDist * defLev * 400;
+    const slPct     = slDist * defLev * 100;
+
+    const label = capital !== null ? `$${fmtMoney(capital)} Margin · ${defLev}x` : `$${defMargin} Margin · ${defLev}x (Beispiel)`;
+    exampleSection =
+      `\n💵 *Beispielrechnung* _(${label}):_\n` +
+      `  → bei TP1: *+$${fmtMoney(tp1Gain / 2)}* _(+${tp1Pct.toFixed(0)}% auf Margin)_\n` +
+      `  → bei TP2: *+$${fmtMoney(tp2Gain)}* _(+${tp2Pct.toFixed(0)}% auf Margin)_\n` +
+      `  → bei SL:  *-$${fmtMoney(slLoss)}* _(-${slPct.toFixed(0)}% auf Margin)_\n`;
+  }
+
+  // ── Confluence score bar ──────────────────────────────────────────────────
+  let confluenceLine = '';
+  if (result.confluenceScore !== null) {
+    const s      = result.confluenceScore;
+    const filled = Math.round(s / 10);
+    const bar    = '█'.repeat(filled) + '░'.repeat(10 - filled);
+    const label  = s >= 80 ? '🔥 SEHR STARK'
+                 : s >= 60 ? '🟢 STARK'
+                 : s >= 40 ? '🟡 MITTEL'
+                 : s >= 20 ? '🟠 SCHWACH'
+                 :           '⚠️ GERING';
+    confluenceLine = `\n🎯 *Confluence Score: ${s}/100* ${label}\n\`${bar}\`\n`;
+  }
+
+  // ── L/S Ratio ─────────────────────────────────────────────────────────────
+  const lsLine = lsRatio !== null
+    ? `  • L/S Ratio: *${lsRatio.toFixed(2)}* — ${lsRatioLabel(lsRatio)}\n`
+    : '';
+
+  const allSignals = result.signals.map((s) => `  • ${s}`).join('\n');
+
+  return (
+    `⚡ *Signal — ${result.symbol}* · 4h · ${nowUTC()}\n\n` +
+    `${emoji} *${dir}: $${result.symbol}* — Signal 👑\n\n` +
+    `📊 *Marktstruktur:*\n${lsLine}` +
+    tpSection +
+    exampleSection +
+    confluenceLine +
+    `\n📈 *Technische Signale:*\n${allSignals}\n\n` +
+    `${tradeLinks(result.symbol)}\n\n` +
+    `_Benutze /in ${result.symbol} MARGIN HEBEL um deinen Trade zu tracken_\n` +
+    `_⚠️ Kein Finanzrat. Auf eigenes Risiko._`
+  );
+}
+
+function buildExitMessage(
+  trade: ActiveTrade,
+  reason: 'sl' | 'tp1' | 'tp2',
+  currentPrice: number,
+  userPos: { margin: number; leverage: number } | null = null,
+): string {
+  const durationH = Math.round((Date.now() - trade.openTime) / 1000 / 60 / 60);
+  const profitPct = pct(trade.entry, currentPrice);
+  const links     = tradeLinks(trade.symbol);
+  const priceStr  = `$${fmt(currentPrice)} _(${profitPct})_`;
+
+  // ── Personalized $ P&L ────────────────────────────────────────────────────
+  let personalPnl = '';
+  if (userPos && trade.risk > 0) {
+    const position  = userPos.margin * userPos.leverage;
+    const slDistPct = trade.risk / trade.entry;
+    let pnlDollar   = 0;
+    let pnlPct      = 0;
+    if (reason === 'tp2') {
+      pnlDollar = position * slDistPct * 4; // 4R
+      pnlPct    = slDistPct * userPos.leverage * 400;
+    } else if (reason === 'tp1') {
+      pnlDollar = position * slDistPct * 2 * 0.5; // half at 2R
+      pnlPct    = slDistPct * userPos.leverage * 100; // half
+    } else {
+      const isBreakEven = trade.tp1Hit;
+      pnlDollar = isBreakEven ? position * slDistPct * 2 * 0.5 : -(position * slDistPct);
+      pnlPct    = isBreakEven ? slDistPct * userPos.leverage * 100 : -(slDistPct * userPos.leverage * 100);
+    }
+    const sign = pnlDollar >= 0 ? '+' : '';
+    personalPnl = `\n\n💵 *Dein Ergebnis* _(${userPos.margin}$ × ${userPos.leverage}x):_\n` +
+                  `${sign}*$${fmtMoney(Math.abs(pnlDollar))}* (${sign}${pnlPct.toFixed(0)}% auf Margin)`;
+  }
+
+  if (reason === 'sl') {
+    const isBreakEven = trade.tp1Hit;
+    return (
+      `🛑 *GEH RAUS — ${trade.symbol}*\n\n` +
+      `${isBreakEven ? '🔄 Break-Even SL — kein Verlust!' : '❌ Stop Loss getroffen!'}\n\n` +
+      `💰 *Ausstieg:* ${priceStr}\n` +
+      `📍 *Entry war:* $${fmt(trade.entry)}\n` +
+      `⏱ *Trade lief:* ${durationH}h\n` +
+      `📊 *Ergebnis:* ${isBreakEven ? '+1R (BE)' : '-1R'}` +
+      personalPnl +
+      `\n\n${links}\n\n` +
+      `_${isBreakEven ? 'TP1 war drin — Rest ohne Risiko.' : 'Verlust begrenzt — nächste Chance kommt.'}_`
+    );
+  }
+
+  if (reason === 'tp1') {
+    return (
+      `🎯 *TP1 getroffen! — ${trade.symbol}*\n\n` +
+      `✅ *Gewinne sichern! 50% raus!*\n\n` +
+      `💰 *Ausstieg:* ${priceStr}\n` +
+      `📍 *Entry war:* $${fmt(trade.entry)}\n` +
+      `⏱ *Trade lief:* ${durationH}h\n` +
+      `📊 *Ergebnis:* +2R erreicht` +
+      personalPnl +
+      `\n\n👉 Hälfte der Position schließen.\n` +
+      `👉 Rest läuft weiter bis TP2 \\($${fmt(trade.tp2)}\\).\n` +
+      `👉 Stop Loss zieht auf Entry 🤖\n\n` +
+      `${links}\n\n` +
+      `_Gewinne gesichert — Rest läuft risikofrei._`
+    );
+  }
+
+  return (
+    `🏆 *TP2 getroffen! — ${trade.symbol}*\n\n` +
+    `✅ *Voller Gewinn! Alles raus!*\n\n` +
+    `💰 *Ausstieg:* ${priceStr}\n` +
+    `📍 *Entry war:* $${fmt(trade.entry)}\n` +
+    `⏱ *Trade lief:* ${durationH}h\n` +
+    `📊 *Ergebnis:* +3R 🔥` +
+    personalPnl +
+    `\n\n${links}\n\n` +
+    `_Perfekter Trade — alles raus._`
+  );
+}
+
+// ─── Send helpers ─────────────────────────────────────────────────────────────
 
 async function sendToChannel(message: string): Promise<void> {
   if (!CHANNEL_ID) return;
@@ -117,141 +315,6 @@ async function sendToChannel(message: string): Promise<void> {
     console.error('[worker] Channel send failed:', (e as Error).message);
   }
 }
-
-// ─── Message builders ─────────────────────────────────────────────────────────
-
-function buildEntryMessage(result: AnalysisResult, capital: number | null = null): string {
-  const isBull = result.direction === 'bullish';
-  const dirLine = isBull
-    ? '🟢 *GEH REIN LONG* — Long Position eröffnen'
-    : '🔴 *GEH REIN SHORT* — Short Position eröffnen';
-
-  const allSignals = result.signals.map((s) => `  • ${s}`).join('\n');
-
-  let tradeLevels = '';
-  let moneyLines  = '';
-  let positionLine = '';
-
-  if (
-    result.entry !== null &&
-    result.stopLoss !== null &&
-    result.takeProfit1 !== null &&
-    result.takeProfit2 !== null &&
-    result.riskReward !== null
-  ) {
-    const riskPct = pct(result.entry, result.stopLoss);
-    const tp1Pct  = pct(result.entry, result.takeProfit1);
-    const tp2Pct  = pct(result.entry, result.takeProfit2);
-    const slDist  = Math.abs(result.entry - result.stopLoss);
-
-    tradeLevels =
-      `\n📍 *Entry:* $${fmt(result.entry)}\n` +
-      `🛑 *Stop Loss:* $${fmt(result.stopLoss)} _(${riskPct})_\n` +
-      `🎯 *TP1:* $${fmt(result.takeProfit1)} _(${tp1Pct})_\n` +
-      `🏆 *TP2:* $${fmt(result.takeProfit2)} _(${tp2Pct})_\n` +
-      `📊 *R:R:* 1 : ${result.riskReward.toFixed(1)}\n`;
-
-    if (capital !== null && capital > 0 && result.entry > 0 && slDist > 0) {
-      const slDistPct  = slDist / result.entry;
-      const riskAmount = capital * 0.02;
-      const position   = Math.min(riskAmount / slDistPct, capital);
-      const slLoss     = position * slDistPct;
-      const tp1Gain    = position * Math.abs(result.takeProfit1 - result.entry) / result.entry;
-      const tp2Gain    = position * Math.abs(result.takeProfit2 - result.entry) / result.entry;
-
-      positionLine = `💼 *Position:* $${fmtMoney(position)} _(2% Risiko von $${fmtMoney(capital)})_\n`;
-      moneyLines   =
-        `\n💵 *In Dollar:*\n` +
-        `  ❌ Max. Verlust: -$${fmtMoney(slLoss)}\n` +
-        `  ✅ Gewinn TP1: +$${fmtMoney(tp1Gain)}\n` +
-        `  🏆 Gewinn TP2: +$${fmtMoney(tp2Gain)}\n`;
-    }
-  }
-
-  // Confluence score bar
-  let confluenceLine = '';
-  if (result.confluenceScore !== null) {
-    const s = result.confluenceScore;
-    const filled  = Math.round(s / 10);
-    const empty   = 10 - filled;
-    const bar     = '█'.repeat(filled) + '░'.repeat(empty);
-    const label   = s >= 80 ? '🔥 SEHR STARK'
-                  : s >= 60 ? '🟢 STARK'
-                  : s >= 40 ? '🟡 MITTEL'
-                  : s >= 20 ? '🟠 SCHWACH'
-                  :           '⚠️ GERING';
-    confluenceLine = `\n🎯 *Confluence Score: ${s}/100* ${label}\n\`${bar}\`\n`;
-  }
-
-  return (
-    `⚡ *Signal — ${result.symbol}* · 4h · ${nowUTC()}\n\n` +
-    `${dirLine}\n` +
-    `💰 *Preis:* $${fmt(result.price)}\n` +
-    tradeLevels +
-    positionLine +
-    moneyLines +
-    confluenceLine +
-    `\n📈 *Signale:*\n${allSignals}\n\n` +
-    `${tradeLinks(result.symbol)}\n\n` +
-    `_⚠️ Kein Finanzrat. Auf eigenes Risiko._`
-  );
-}
-
-function buildExitMessage(
-  trade: ActiveTrade,
-  reason: 'sl' | 'tp1' | 'tp2',
-  currentPrice: number,
-): string {
-  const durationH = Math.round((Date.now() - trade.openTime) / 1000 / 60 / 60);
-  const profitPct = pct(trade.entry, currentPrice);
-  const links     = tradeLinks(trade.symbol);
-  const priceStr  = `$${fmt(currentPrice)} _(${profitPct})_`;
-
-  if (reason === 'sl') {
-    const isBreakEven = trade.tp1Hit; // SL was moved to entry after TP1
-    return (
-      `🛑 *GEH RAUS — ${trade.symbol}*\n\n` +
-      `${isBreakEven ? '🔄 Break-Even SL getroffen — kein Verlust!' : '❌ Stop Loss getroffen!'}\n\n` +
-      `💰 *Ausstiegspreis:* ${priceStr}\n` +
-      `📍 *Entry war:* $${fmt(trade.entry)}\n` +
-      `⏱ *Trade lief:* ${durationH}h\n` +
-      `📊 *Ergebnis:* ${isBreakEven ? '±0R (Break-Even)' : '-1R (Max. Verlust begrenzt)'}\n\n` +
-      `👉 Position schließen.\n\n` +
-      `${links}\n\n` +
-      `_${isBreakEven ? 'TP1 war drin — Rest ohne Risiko gelaufen.' : 'Verlust begrenzt — nächste Chance kommt.'}_`
-    );
-  }
-
-  if (reason === 'tp1') {
-    return (
-      `🎯 *GEH RAUS (halb) — ${trade.symbol}*\n\n` +
-      `✅ *TP1 erreicht! Gewinne sichern!*\n\n` +
-      `💰 *Ausstiegspreis:* ${priceStr}\n` +
-      `📍 *Entry war:* $${fmt(trade.entry)}\n` +
-      `⏱ *Trade lief:* ${durationH}h\n` +
-      `📊 *Ergebnis:* +1.5R erreicht\n\n` +
-      `👉 Hälfte der Position schließen.\n` +
-      `👉 Rest läuft weiter bis TP2 ($${fmt(trade.tp2)}).\n` +
-      `👉 Stop Loss wird automatisch auf Entry gezogen 🤖\n\n` +
-      `${links}\n\n` +
-      `_Gewinne gesichert — Rest läuft jetzt risikofrei._`
-    );
-  }
-
-  return (
-    `🏆 *GEH RAUS (alles) — ${trade.symbol}*\n\n` +
-    `✅ *TP2 erreicht — Voller Gewinn!*\n\n` +
-    `💰 *Ausstiegspreis:* ${priceStr}\n` +
-    `📍 *Entry war:* $${fmt(trade.entry)}\n` +
-    `⏱ *Trade lief:* ${durationH}h\n` +
-    `📊 *Ergebnis:* +3R erreicht 🔥\n\n` +
-    `👉 Gesamte Position schließen und Gewinn mitnehmen.\n\n` +
-    `${links}\n\n` +
-    `_Perfekter Trade. Alles raus._`
-  );
-}
-
-// ─── Send helpers ─────────────────────────────────────────────────────────────
 
 async function sendToTradeUsers(trade: ActiveTrade, message: string): Promise<void> {
   for (const { telegram_id } of trade.users) {
@@ -263,6 +326,41 @@ async function sendToTradeUsers(trade: ActiveTrade, message: string): Promise<vo
   }
   if (trade.postToChannel) {
     await sendToChannel(message);
+  }
+}
+
+async function sendPersonalPnl(
+  trade: ActiveTrade,
+  reason: 'sl' | 'tp1' | 'tp2',
+  currentPrice: number,
+): Promise<void> {
+  try {
+    const positions = await getUsersInPosition(trade.symbol);
+    if (positions.length === 0) return;
+
+    // Close positions in DB after TP2 or SL
+    if (reason === 'tp2' || reason === 'sl') {
+      await closeUserPositions(trade.symbol);
+    }
+
+    for (const pos of positions) {
+      // Skip if user already received trade exit via trade.users
+      const alreadyNotified = trade.users.some((u) => u.telegram_id === pos.telegram_id);
+      const msg = buildExitMessage(trade, reason, currentPrice, pos);
+      try {
+        if (alreadyNotified) {
+          // User is a watcher — exit message already sent, just append personalized P&L
+          // (already included in message via personalPnl)
+        } else {
+          // Channel user who used /in — send them personal notification
+          await bot.api.sendMessage(pos.telegram_id, msg, { parse_mode: 'Markdown' });
+        }
+      } catch (e) {
+        console.error(`[worker] Personal P&L to ${pos.telegram_id} failed:`, (e as Error).message);
+      }
+    }
+  } catch (e) {
+    console.error('[worker] sendPersonalPnl failed:', (e as Error).message);
   }
 }
 
@@ -279,61 +377,67 @@ async function checkActiveTrade(
   if (direction === 'bullish') {
     if (high >= tp2) {
       console.log(`[worker] ${symbol} TP2 hit`);
-      await sendToTradeUsers(trade, buildExitMessage(trade, 'tp2', close));
+      const msg = buildExitMessage(trade, 'tp2', close);
+      await sendToTradeUsers(trade, msg);
+      await sendPersonalPnl(trade, 'tp2', close);
       if (trade.signalLogId) await closeSignal(trade.signalLogId, 'tp2', close, 3.0).catch(console.error);
       activeTrades.delete(symbol);
       return;
     }
     if (!trade.tp1Hit && high >= tp1) {
       console.log(`[worker] ${symbol} TP1 hit — moving SL to break-even`);
-      await sendToTradeUsers(trade, buildExitMessage(trade, 'tp1', close));
+      const msg = buildExitMessage(trade, 'tp1', close);
+      await sendToTradeUsers(trade, msg);
+      await sendPersonalPnl(trade, 'tp1', close);
       trade.tp1Hit = true;
-      trade.sl = trade.entry; // ← Auto break-even
+      trade.sl     = trade.entry;
       return;
     }
     if (low <= sl) {
-      const reason = trade.tp1Hit ? 'be' : 'sl';
-      // BE: half out at TP1 (+2R×0.5=+1R) + half at entry (0R) = +1R total
+      const reason  = trade.tp1Hit ? 'be' as const : 'sl' as const;
       const resultR = trade.tp1Hit ? 1.0 : -1;
-      console.log(`[worker] ${symbol} SL hit${trade.tp1Hit ? ' (break-even)' : ''}`);
-      await sendToTradeUsers(trade, buildExitMessage(trade, 'sl', close));
-      const closeReason1 = trade.tp1Hit ? 'be' as const : 'sl' as const;
-      if (trade.signalLogId) await closeSignal(trade.signalLogId, closeReason1, close, resultR).catch(console.error);
+      console.log(`[worker] ${symbol} SL hit${trade.tp1Hit ? ' (BE)' : ''}`);
+      const msg = buildExitMessage(trade, 'sl', close);
+      await sendToTradeUsers(trade, msg);
+      await sendPersonalPnl(trade, 'sl', close);
+      if (trade.signalLogId) await closeSignal(trade.signalLogId, reason, close, resultR).catch(console.error);
       activeTrades.delete(symbol);
       return;
     }
   } else {
     if (low <= tp2) {
       console.log(`[worker] ${symbol} TP2 hit`);
-      await sendToTradeUsers(trade, buildExitMessage(trade, 'tp2', close));
+      const msg = buildExitMessage(trade, 'tp2', close);
+      await sendToTradeUsers(trade, msg);
+      await sendPersonalPnl(trade, 'tp2', close);
       if (trade.signalLogId) await closeSignal(trade.signalLogId, 'tp2', close, 3.0).catch(console.error);
       activeTrades.delete(symbol);
       return;
     }
     if (!trade.tp1Hit && low <= tp1) {
       console.log(`[worker] ${symbol} TP1 hit — moving SL to break-even`);
-      await sendToTradeUsers(trade, buildExitMessage(trade, 'tp1', close));
+      const msg = buildExitMessage(trade, 'tp1', close);
+      await sendToTradeUsers(trade, msg);
+      await sendPersonalPnl(trade, 'tp1', close);
       trade.tp1Hit = true;
-      trade.sl = trade.entry; // ← Auto break-even
+      trade.sl     = trade.entry;
       return;
     }
     if (high >= sl) {
-      // TP1 hit = +1.5R on half, BE on rest -> avg +0.75R
-      const resultR = trade.tp1Hit ? 0.75 : -1;
-      const closeReason2 = trade.tp1Hit ? 'be' as const : 'sl' as const;
-      console.log(`[worker] ${symbol} SL hit${trade.tp1Hit ? ' (break-even +0.75R)' : ''}`);
-      await sendToTradeUsers(trade, buildExitMessage(trade, 'sl', close));
-      if (trade.signalLogId) await closeSignal(trade.signalLogId, closeReason2, close, resultR).catch(console.error);
+      const reason  = trade.tp1Hit ? 'be' as const : 'sl' as const;
+      const resultR = trade.tp1Hit ? 1.0 : -1;
+      console.log(`[worker] ${symbol} SL hit${trade.tp1Hit ? ' (BE)' : ''}`);
+      const msg = buildExitMessage(trade, 'sl', close);
+      await sendToTradeUsers(trade, msg);
+      await sendPersonalPnl(trade, 'sl', close);
+      if (trade.signalLogId) await closeSignal(trade.signalLogId, reason, close, resultR).catch(console.error);
       activeTrades.delete(symbol);
       return;
     }
   }
 }
 
-// ─── Analysis tick ────────────────────────────────────────────────────────────
-
 // ─── BTC Macro Shift Alert ───────────────────────────────────────────────────
-// Fires once when BTC crosses its EMA200 — signals a market regime change
 
 async function checkBtcMacroShift(): Promise<void> {
   try {
@@ -349,26 +453,15 @@ async function checkBtcMacroShift(): Promise<void> {
     const current: 'bullish' | 'bearish' = price > ema200 ? 'bullish' : 'bearish';
 
     if (lastBtcMacro !== null && current !== lastBtcMacro) {
-      // Regime changed — alert channel and admin
       const isBull = current === 'bullish';
       const msg =
-        `🌍 *BTC Makro-Shift — Marktregime geändert!*
-
-` +
-        `${isBull ? '🟢' : '🔴'} BTC ist jetzt *${isBull ? 'BULLISCH' : 'BÄRISCH'}* (EMA200)
-
-` +
-        `📍 *BTC Preis:* $${price.toLocaleString('en-US', { maximumFractionDigits: 0 })}
-` +
-        `📊 *EMA200:* $${ema200.toLocaleString('en-US', { maximumFractionDigits: 0 })}
-
-` +
+        `🌍 *BTC Makro-Shift — Marktregime geändert!*\n\n` +
+        `${isBull ? '🟢' : '🔴'} BTC ist jetzt *${isBull ? 'BULLISCH' : 'BÄRISCH'}* (EMA200)\n\n` +
+        `📍 *BTC Preis:* $${price.toLocaleString('en-US', { maximumFractionDigits: 0 })}\n` +
+        `📊 *EMA200:* $${ema200.toLocaleString('en-US', { maximumFractionDigits: 0 })}\n\n` +
         `${isBull
-          ? '👉 Bot wechselt in _Long-Modus_ — Short-Signale auf Altcoins werden unterdrückt.'
-          : '👉 Bot wechselt in _Short-Modus_ — Long-Signale auf Altcoins werden unterdrückt.'
-        }
-
-` +
+          ? '👉 Bot wechselt in _Long-Modus_'
+          : '👉 Bot wechselt in _Short-Modus_'}\n\n` +
         `_MarketLens Makro-Alert · ${new Date().toLocaleString('de-DE', { timeZone: 'Europe/Berlin' })} Berlin_`;
 
       await sendToChannel(msg);
@@ -382,11 +475,12 @@ async function checkBtcMacroShift(): Promise<void> {
   }
 }
 
+// ─── Analysis tick ────────────────────────────────────────────────────────────
+
 async function runAnalysis(): Promise<void> {
   console.log('[worker] Running analysis tick…');
 
   const watched = await getAllWatchedSymbols();
-
   const symbolMap = new Map<string, string[]>();
   for (const { symbol, user_ids } of watched) {
     symbolMap.set(symbol, user_ids);
@@ -402,73 +496,55 @@ async function runAnalysis(): Promise<void> {
     return;
   }
 
-  // ── BTC Master Filter ─────────────────────────────────────────────────────
-  // Fetch BTC direction once per tick. Used to gate altcoin signals:
-  //   LONG  altcoin → only when BTC is NOT bearish (neutral or bullish)
-  //   SHORT altcoin → only when BTC is NOT bullish (neutral or bearish)
+  // BTC Master Filter
   let btcDirection: 'bullish' | 'bearish' | null = null;
   try {
-    const btcCandles4h = await getCandles('BTCUSDT', '4h', 100);
+    const btcCandles4h = await getCandles('BTCUSDT', '4h', 250);
     btcDirection = analyzeCandles('BTCUSDT', btcCandles4h).direction;
     console.log(`[worker] BTC Master Filter: ${btcDirection ?? 'neutral'}`);
   } catch (e) {
-    console.warn('[worker] Could not fetch BTC for master filter, proceeding unfiltered:', (e as Error).message);
+    console.warn('[worker] Could not fetch BTC for master filter:', (e as Error).message);
   }
 
   for (const [symbol, user_ids] of symbolMap) {
     try {
       const [candles4h, candles1h] = await Promise.all([
-        getCandles(symbol, '4h', 100),
+        getCandles(symbol, '4h', 250),
         getCandles(symbol, '1h', 100),
       ]);
       const isChannelSymbol = CHANNEL_ID !== null && CHANNEL_SYMBOLS.includes(symbol);
 
-      // 1. Check active trade first (uses 4h candles for price action)
+      // Check active trade
       const activeTrade = activeTrades.get(symbol);
       if (activeTrade) {
         await checkActiveTrade(activeTrade, candles4h);
       }
-
       if (activeTrades.has(symbol)) continue;
 
-      // 2. Multi-timeframe analysis: 4h is primary, 1h must confirm
-      const result4h: AnalysisResult = analyzeCandles(symbol, candles4h);
-      const result1h: AnalysisResult = analyzeCandles(symbol, candles1h);
+      // Multi-timeframe analysis
+      const result4h = analyzeCandles(symbol, candles4h);
+      const result1h = analyzeCandles(symbol, candles1h);
 
-      // Both timeframes must agree on direction
       if (!isNotifiableSignal(result4h)) continue;
       if (result1h.direction === null || result1h.direction !== result4h.direction) {
-        console.log(`[worker] ${symbol} skipped — 1h (${result1h.direction ?? 'none'}) vs 4h (${result4h.direction}) mismatch`);
+        console.log(`[worker] ${symbol} skipped — TF mismatch (${result1h.direction} vs ${result4h.direction})`);
         continue;
       }
 
-      // 3. BTC Master Filter (skip for BTC itself)
+      // BTC Master Filter
       if (symbol !== 'BTCUSDT' && btcDirection !== null) {
-        if (result4h.direction === 'bullish' && btcDirection === 'bearish') {
-          console.log(`[worker] ${symbol} LONG blocked — BTC Master Filter (BTC bearish)`);
-          continue;
-        }
-        if (result4h.direction === 'bearish' && btcDirection === 'bullish') {
-          console.log(`[worker] ${symbol} SHORT blocked — BTC Master Filter (BTC bullish)`);
-          continue;
-        }
+        if (result4h.direction === 'bullish' && btcDirection === 'bearish') continue;
+        if (result4h.direction === 'bearish' && btcDirection === 'bullish') continue;
       }
 
-      // Merge: use 4h trade levels, add 1h confirmation note to signals
+      // Merge results
       const btcNote = symbol !== 'BTCUSDT' && btcDirection !== null
-        ? `, BTC ${btcDirection === 'bullish' ? 'bullisch' : 'baerisch'} ✅`
-        : '';
+        ? `, BTC ${btcDirection === 'bullish' ? 'bullisch' : 'baerisch'} ✅` : '';
       const result: AnalysisResult = {
         ...result4h,
         signals: [
           ...result4h.signals,
-          `1h Bestaetigung: ${result1h.direction === 'bullish' ? 'bullisch' : 'baerisch'} (Score ${
-            result1h.signals.filter(s =>
-              s.includes('RSI') || s.includes('MACD') || s.includes('Bollinger') ||
-              s.includes('StochRSI') || s.includes('Divergenz') ||
-              ['Hammer','Bullish Engulfing','Shooting Star','Bearish Engulfing','Morning Star','Bullish Marubozu','Bearish Marubozu','Doji'].some(p => s.includes(p))
-            ).length
-          } Indikatoren${btcNote}) ✅`,
+          `1h Bestaetigung: ${result1h.direction === 'bullish' ? 'bullisch' : 'baerisch'}${btcNote} ✅`,
         ],
       };
 
@@ -477,35 +553,38 @@ async function runAnalysis(): Promise<void> {
         console.log(`[worker] ${symbol} alert suppressed (cooldown)`);
         continue;
       }
-
       lastAlertTime.set(symbol, Date.now());
+
+      // Fetch L/S Ratio
+      const lsRatio = await fetchLsRatio(symbol);
 
       const users = user_ids.length > 0 ? await getUsersForAlert(user_ids) : [];
 
-      // 3. Log signal to Supabase
+      // Log to Supabase
       let signalLogId: string | null = null;
-      if (result.entry !== null && result.stopLoss !== null && result.takeProfit1 !== null && result.takeProfit2 !== null && result.direction !== null) {
+      if (result.entry && result.stopLoss && result.takeProfit1 && result.takeProfit2 && result.direction) {
         try {
           signalLogId = await logSignal({
             symbol,
-            direction: result.direction,
-            entry: result.entry,
-            stop_loss: result.stopLoss,
-            take_profit1: result.takeProfit1,
-            take_profit2: result.takeProfit2,
-            risk_reward: result.riskReward,
-            signals: result.signals,
-            ema50: result.ema50 ?? null,
-            volume_ratio: result.volumeRatio ?? null,
+            direction:     result.direction,
+            entry:         result.entry,
+            stop_loss:     result.stopLoss,
+            take_profit1:  result.takeProfit1,
+            take_profit2:  result.takeProfit2,
+            risk_reward:   result.riskReward,
+            signals:       result.signals,
+            ema50:         result.ema50 ?? null,
+            volume_ratio:  result.volumeRatio ?? null,
           });
-          console.log(`[worker] Signal logged: ${signalLogId}`);
         } catch (e) {
           console.error('[worker] Failed to log signal:', (e as Error).message);
         }
       }
 
-      // 4. Register active trade
-      if (result.entry !== null && result.stopLoss !== null && result.takeProfit1 !== null && result.takeProfit2 !== null && result.direction !== null) {
+      // Register active trade
+      if (result.entry && result.stopLoss && result.takeProfit1 && result.takeProfit2 && result.direction) {
+        const isBull = result.direction === 'bullish';
+        const risk   = Math.abs(result.entry - result.stopLoss);
         activeTrades.set(symbol, {
           symbol,
           direction:     result.direction,
@@ -514,34 +593,33 @@ async function runAnalysis(): Promise<void> {
           originalSl:    result.stopLoss,
           tp1:           result.takeProfit1,
           tp2:           result.takeProfit2,
+          tp3:           isBull ? result.entry + risk * 6 : result.entry - risk * 6,
+          tp4:           isBull ? result.entry + risk * 8 : result.entry - risk * 8,
+          risk,
           users,
           openTime:      Date.now(),
           tp1Hit:        false,
           postToChannel: isChannelSymbol,
           signalLogId,
         });
-        console.log(`[worker] Active trade opened: ${symbol} ${result.direction}`);
       }
 
-      // 5. Send to individual users
+      // Send signals
+      const channelMsg = buildEntryMessage(result, null, lsRatio);
       for (const { telegram_id, capital } of users) {
         try {
           await bot.api.sendMessage(
             telegram_id,
-            buildEntryMessage(result, capital),
+            buildEntryMessage(result, capital, lsRatio),
             { parse_mode: 'Markdown' },
           );
         } catch (e) {
           console.error(`[worker] sendMessage to ${telegram_id} failed:`, (e as Error).message);
         }
       }
+      if (isChannelSymbol) await sendToChannel(channelMsg);
 
-      // 6. Send to channel
-      if (isChannelSymbol) {
-        await sendToChannel(buildEntryMessage(result, null));
-      }
-
-      console.log(`[worker] Alert sent for ${symbol} — users: ${users.length}, channel: ${isChannelSymbol}`);
+      console.log(`[worker] Alert sent for ${symbol} — users: ${users.length}, channel: ${isChannelSymbol}, L/S: ${lsRatio ?? 'n/a'}`);
     } catch (e) {
       console.error(`[worker] Analysis failed for ${symbol}:`, (e as Error).message);
     }
@@ -551,7 +629,6 @@ async function runAnalysis(): Promise<void> {
 // ─── News pipeline ────────────────────────────────────────────────────────────
 
 async function runNewsPipeline(): Promise<void> {
-  console.log('[worker] Running news pipeline…');
   try {
     const [cryptoNews, macroNews] = await Promise.allSettled([
       fetchCryptoPanicNews(20),
@@ -561,10 +638,7 @@ async function runNewsPipeline(): Promise<void> {
       ...(cryptoNews.status === 'fulfilled' ? cryptoNews.value : []),
       ...(macroNews.status  === 'fulfilled' ? macroNews.value  : []),
     ];
-    if (cryptoNews.status === 'rejected') console.error('[worker] CryptoPanic failed:', cryptoNews.reason);
-    if (macroNews.status  === 'rejected') console.error('[worker] NewsAPI/Claude failed:', macroNews.reason);
     await upsertNewsItems(items);
-    console.log(`[worker] News cache updated with ${items.length} items.`);
   } catch (e) {
     console.error('[worker] News pipeline error:', (e as Error).message);
   }
@@ -573,31 +647,52 @@ async function runNewsPipeline(): Promise<void> {
 // ─── Daily recap at 20:00 CET/CEST ──────────────────────────────────────────
 
 async function checkDailyRecap(): Promise<void> {
-  const now = new Date();
-  // Get current time in Berlin timezone
+  const now       = new Date();
   const berlinStr = now.toLocaleString('en-US', { timeZone: 'Europe/Berlin', hour12: false, hour: '2-digit', minute: '2-digit' });
   const [hourStr, minuteStr] = berlinStr.split(':');
   const hour   = parseInt(hourStr, 10);
   const minute = parseInt(minuteStr, 10);
+  const berlinDate = new Date(now.toLocaleString('en-US', { timeZone: 'Europe/Berlin' })).toISOString().split('T')[0];
 
-  // Date string in Berlin (to track if recap already sent today)
-  const berlinDate = new Date(now.toLocaleString('en-US', { timeZone: 'Europe/Berlin' }))
-    .toISOString().split('T')[0];
-
-  // Fire once when clock hits 20:00–20:04 Berlin time
   if (hour === 20 && minute < 5 && berlinDate !== lastRecapDate) {
     lastRecapDate = berlinDate;
-
-    // Get all user telegram_ids to notify
     let userIds: number[] = [];
     try {
       const users = await getAllUsers();
       userIds = users.map((u) => u.telegram_id);
-    } catch (e) {
-      console.error('[recap] Failed to fetch users:', (e as Error).message);
-    }
-
+    } catch (e) { /* ignore */ }
     await sendDailyRecap(bot, CHANNEL_ID, userIds);
+  }
+}
+
+// ─── Morning Briefing at 08:00 Berlin ────────────────────────────────────────
+
+async function checkMorningBriefing(): Promise<void> {
+  const now       = new Date();
+  const berlinStr = now.toLocaleString('en-US', { timeZone: 'Europe/Berlin', hour12: false, hour: '2-digit', minute: '2-digit' });
+  const [hourStr, minuteStr] = berlinStr.split(':');
+  const hour   = parseInt(hourStr, 10);
+  const minute = parseInt(minuteStr, 10);
+  const berlinDate = new Date(now.toLocaleString('en-US', { timeZone: 'Europe/Berlin' })).toISOString().split('T')[0];
+
+  if (hour === 8 && minute < 5 && berlinDate !== lastBriefingDate) {
+    lastBriefingDate = berlinDate;
+    console.log('[worker] Sending morning briefing…');
+    try {
+      const msg = await buildMorningBriefing();
+      await sendToChannel(msg);
+      // Also send to all bot users
+      try {
+        const users = await getAllUsers();
+        for (const u of users) {
+          try {
+            await bot.api.sendMessage(u.telegram_id, msg, { parse_mode: 'Markdown' });
+          } catch { /* ignore per-user failures */ }
+        }
+      } catch { /* ignore if getAllUsers fails */ }
+    } catch (e) {
+      console.error('[worker] Morning briefing failed:', (e as Error).message);
+    }
   }
 }
 
@@ -606,6 +701,7 @@ async function checkDailyRecap(): Promise<void> {
 async function tick(): Promise<void> {
   await Promise.allSettled([runAnalysis(), runNewsPipeline()]);
   await checkDailyRecap();
+  await checkMorningBriefing();
   await checkBtcMacroShift();
 }
 
@@ -616,21 +712,18 @@ async function notifyAdmin(message: string): Promise<void> {
   if (!adminId) return;
   try {
     await bot.api.sendMessage(adminId, message, { parse_mode: 'Markdown' });
-  } catch (e) {
-    console.error('[monitor] Failed to notify admin:', (e as Error).message);
-  }
+  } catch (e) { /* ignore */ }
 }
 
-// ─── Restore active trades after restart ──────────────────────────────────────
+// ─── Restore active trades ────────────────────────────────────────────────────
 
 async function restoreActiveTrades(): Promise<void> {
   try {
     const openSignals = await getActiveSignals();
-    if (openSignals.length === 0) return;
-
     for (const sig of openSignals) {
-      if (activeTrades.has(sig.symbol)) continue; // already tracked
-
+      if (activeTrades.has(sig.symbol)) continue;
+      const isBull = sig.direction === 'bullish';
+      const risk   = Math.abs(sig.entry - sig.stop_loss);
       activeTrades.set(sig.symbol, {
         symbol:        sig.symbol,
         direction:     sig.direction as 'bullish' | 'bearish',
@@ -639,37 +732,38 @@ async function restoreActiveTrades(): Promise<void> {
         originalSl:    sig.stop_loss,
         tp1:           sig.take_profit1,
         tp2:           sig.take_profit2,
-        users:         [], // entry alerts already sent — no DMs on exit after restart
+        tp3:           isBull ? sig.entry + risk * 6 : sig.entry - risk * 6,
+        tp4:           isBull ? sig.entry + risk * 8 : sig.entry - risk * 8,
+        risk,
+        users:         [],
         openTime:      new Date(sig.opened_at).getTime(),
         tp1Hit:        false,
         postToChannel: CHANNEL_ID !== null && CHANNEL_SYMBOLS.includes(sig.symbol),
         signalLogId:   sig.id,
       });
-
-      console.log(`[worker] Restored trade: ${sig.symbol} ${sig.direction} from ${sig.opened_at}`);
+      console.log('[worker] Restored: ' + sig.symbol + ' ' + sig.direction);
     }
-
-    console.log(`[worker] Restored ${openSignals.length} active trade(s) from Supabase`);
+    console.log('[worker] Restored ' + openSignals.length + ' active trade(s)');
   } catch (e) {
-    console.error('[worker] Could not restore active trades:', (e as Error).message);
+    console.error('[worker] Could not restore trades:', (e as Error).message);
   }
 }
 
-// ─── Entry point ──────────────────────────────────────────────────────────────
+// ─── Entry point ────────────────────────────────────────────────
 
 async function main(): Promise<void> {
-  console.log(`[worker] Starting — interval: ${INTERVAL_MS / 60000} min`);
-  if (CHANNEL_ID) console.log(`[worker] Channel broadcasting active: ${CHANNEL_ID}`);
+  console.log('[worker] Starting — interval: ' + INTERVAL_MS / 60000 + ' min');
+  if (CHANNEL_ID) console.log('[worker] Channel: ' + CHANNEL_ID);
   await restoreActiveTrades();
-  await notifyAdmin(`⚙️ *Worker gestartet!*\nAnalyse-Intervall: ${INTERVAL_MS / 60000} min\n_${new Date().toISOString()}_`);
+  await notifyAdmin('Worker gestartet!\nIntervall: ' + INTERVAL_MS / 60000 + ' min\n' + new Date().toISOString());
   setInterval(tick, INTERVAL_MS);
   await tick();
 }
 
 process.on('uncaughtException', async (err) => {
-  await notifyAdmin(`🔴 *Worker crashed!*\n\`${err.message}\`\n\nRailway wird neu starten…`);
+  await notifyAdmin('Worker crashed!\n' + err.message);
 });
 
 main().catch(async (e) => {
-  await notifyAdmin(`🔴 *Worker fatal error!*\n\`${(e as Error).message}\``);
+  await notifyAdmin('Worker fatal error!\n' + (e as Error).message);
 });

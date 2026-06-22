@@ -1,6 +1,7 @@
 import {
   EMA,
   ATR,
+  ADX,
 } from 'technicalindicators';
 import { Candle, AnalysisResult } from '../types';
 
@@ -47,6 +48,24 @@ function swingHigh(candles: Candle[], lookback = 20): number {
   return Math.max(...candles.slice(-lookback).map((c) => c.high));
 }
 
+// ─── ADX (Rising Momentum) ────────────────────────────────────────────────────
+// Returns true when ADX is rising over the last 3 candles — trend building up.
+// This fires early in the trend, right when EMA crosses happen.
+
+function isAdxRising(candles: Candle[], period = 14): boolean {
+  if (candles.length < period * 2 + 4) return true; // not enough data = don't filter
+  const values = ADX.calculate({
+    high:  candles.map((c) => c.high),
+    low:   candles.map((c) => c.low),
+    close: candles.map((c) => c.close),
+    period,
+  });
+  if (values.length < 4) return true;
+  const now  = values[values.length - 1].adx;
+  const prev = values[values.length - 4].adx;
+  return now > prev;
+}
+
 interface TradeLevels {
   entry: number; stopLoss: number; takeProfit1: number; takeProfit2: number; riskReward: number;
 }
@@ -58,7 +77,7 @@ function calcTradeLevels(candles: Candle[], direction: 'bullish' | 'bearish'): T
   if (direction === 'bullish') {
     const sl   = Math.max(swingLow(candles, 20), price - atr * 1.5);
     const risk = price - sl;
-    if (risk <= 0 || risk / price > 0.08) return null; // skip if SL > 8%
+    if (risk <= 0 || risk / price > 0.08) return null;
     return {
       entry: price, stopLoss: sl,
       takeProfit1: price + risk * 2.0,
@@ -107,7 +126,6 @@ function calcConfluenceScore(
   breakdown.push(`Vol ${vr.toFixed(1)}x avg → ${volPts}/30`);
 
   // ── 2. EMA200 distance (0–25 pts) ────────────────────────────────────────
-  // How far is price from EMA200? Farther = cleaner macro trend
   let ema200Pts = 0;
   if (ema200 !== null) {
     const dist = Math.abs(price - ema200) / price * 100;
@@ -117,13 +135,12 @@ function calcConfluenceScore(
     else if (dist >= 1)  ema200Pts = 6;
     breakdown.push(`EMA200 Abstand ${dist.toFixed(1)}% → ${ema200Pts}/25`);
   } else {
-    ema200Pts = 12; // no EMA200 data = neutral
+    ema200Pts = 12;
     breakdown.push(`EMA200 n/a → ${ema200Pts}/25`);
   }
   score += ema200Pts;
 
   // ── 3. EMA20 slope (0–25 pts) ────────────────────────────────────────────
-  // How steeply is EMA20 moving? Steeper slope = stronger momentum
   let slopePts = 0;
   if (ema20Series.length >= 5) {
     const ema20Now  = ema20Series[ema20Series.length - 1];
@@ -142,8 +159,6 @@ function calcConfluenceScore(
   score += slopePts;
 
   // ── 4. EMA50 alignment clarity (0–20 pts) ────────────────────────────────
-  // How long was the previous opposite setup before this cross?
-  // More candles in prior trend = cleaner reversal
   let alignPts = 0;
   if (ema20Series.length >= 10 && ema50Series.length >= 10) {
     let streak = 0;
@@ -168,10 +183,10 @@ function calcConfluenceScore(
 // ─── Main Analysis: EMA Cross Strategy ───────────────────────────────────────
 //
 // Signal fires when:
-//   LONG:  EMA20 crosses above EMA50 AND price > EMA200 (macro uptrend)
-//   SHORT: EMA20 crosses below EMA50 AND price < EMA200 (macro downtrend)
+//   LONG:  EMA20 crosses above EMA50 AND price > EMA200 AND ADX rising
+//   SHORT: EMA20 crosses below EMA50 AND price < EMA200 AND ADX rising
 //
-// This is a trend-following approach — we ride the trend, not fight it.
+// ADX rising = trend momentum is building up (catches early trend phase)
 
 export function analyzeCandles(symbol: string, candles: Candle[]): AnalysisResult {
   const closes = candles.map((c) => c.close);
@@ -191,6 +206,9 @@ export function analyzeCandles(symbol: string, candles: Candle[]): AnalysisResul
   // Volume must be at least average
   const volumeOk = volumeRatio === null || volumeRatio >= 1.0;
 
+  // ADX rising filter
+  const adxOk = isAdxRising(candles);
+
   // EMA20/50 cross detection
   const goldenCross = ema20p !== null && ema50p !== null && ema20 !== null && ema50 !== null &&
     ema20p <= ema50p && ema20 > ema50;
@@ -202,8 +220,8 @@ export function analyzeCandles(symbol: string, candles: Candle[]): AnalysisResul
   const macroDowntrend = ema200 === null || price < ema200;
 
   let direction: 'bullish' | 'bearish' | null = null;
-  if (goldenCross && macroUptrend   && volumeOk) direction = 'bullish';
-  if (deathCross  && macroDowntrend && volumeOk) direction = 'bearish';
+  if (goldenCross && macroUptrend   && volumeOk && adxOk) direction = 'bullish';
+  if (deathCross  && macroDowntrend && volumeOk && adxOk) direction = 'bearish';
 
   // Build signal info lines
   const signals: string[] = [];
@@ -218,8 +236,9 @@ export function analyzeCandles(symbol: string, candles: Candle[]): AnalysisResul
   if (volumeRatio !== null) {
     signals.push(`Volumen: ${volumeRatio.toFixed(2)}x Durchschnitt ${volumeRatio >= 1.0 ? '✅' : '⚠️'}`);
   }
+  signals.push(`ADX Momentum: ${adxOk ? '✅ steigend' : '⚠️ flach/fallend'}`);
 
-  // Confluence score (computed regardless of signal — shows setup quality)
+  // Confluence score
   const { score: confluenceScore, breakdown: confluenceBreakdown } =
     direction !== null
       ? calcConfluenceScore(candles, ema20Series, ema50Series, ema200, volumeRatio, direction)
@@ -240,7 +259,7 @@ export function analyzeCandles(symbol: string, candles: Candle[]): AnalysisResul
       takeProfit2 = levels.takeProfit2;
       riskReward  = levels.riskReward;
     } else {
-      direction = null; // invalid levels, skip signal
+      direction = null;
     }
   }
 

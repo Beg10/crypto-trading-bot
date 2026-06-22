@@ -1,16 +1,22 @@
 const axios = require('axios');
-const { EMA, ATR } = require('technicalindicators');
+const { EMA, ATR, ADX } = require('technicalindicators');
 
-// ── Config — must match src/services/analysis.ts exactly ──────────────────────
+// ── Config ─────────────────────────────────────────────────────────────────────
 const COINS = ['BTCUSDT', 'ETHUSDT', 'XRPUSDT', 'LTCUSDT', 'BNBUSDT', 'ATOMUSDT', 'SOLUSDT'];
-const VOL_THRESHOLD   = 1.0;   // volume >= 1.2x average
-const SPREAD_MIN      = 0.003; // EMA20-EMA50 spread >= 0.3% of price
+const VOL_THRESHOLD   = 1.0;
 const SL_ATR_MULT     = 1.5;
 const MAX_SL_PCT      = 0.08;
 const TP1_R           = 2.0;
 const TP2_R           = 4.0;
-const COOLDOWN        = 6;     // candles (6 × 4h = 24h)
-const LOOKBACK        = 210;   // candles needed for EMA200
+const COOLDOWN        = 6;
+const LOOKBACK        = 210;
+const ADX_PERIOD      = 14;
+// Test both modes via env var:
+//   ADX_MODE=threshold node backtest.js  → ADX >= threshold
+//   ADX_MODE=rising    node backtest.js  → ADX rising over last 3 candles
+//   (default = rising)
+const ADX_MODE      = process.env.ADX_MODE || 'rising';
+const ADX_THRESHOLD = Number(process.env.ADX_MIN || 20);
 
 async function fetchCandles(symbol, interval = '4h', limit = 1000) {
   const res = await axios.get('https://api.binance.com/api/v3/klines', {
@@ -33,6 +39,16 @@ function calcATR(candles, period = 14) {
     close: candles.map(c => c.close), period,
   });
   return v.length > 0 ? v[v.length - 1] : null;
+}
+
+function calcADXSeries(candles, period = ADX_PERIOD) {
+  if (candles.length < period * 2) return [];
+  return ADX.calculate({
+    high:  candles.map(c => c.high),
+    low:   candles.map(c => c.low),
+    close: candles.map(c => c.close),
+    period,
+  });
 }
 
 function calcVolumeRatio(candles, period = 20) {
@@ -58,30 +74,38 @@ function analyze(candles, btcDirection) {
   const ema50p = ema50s[ema50s.length - 2];
   const ema200 = ema200s[ema200s.length - 1];
 
-  // Volume filter
   const volRatio = calcVolumeRatio(candles);
   const volOk    = volRatio === null || volRatio >= VOL_THRESHOLD;
 
-  // Cross detection
+  // ADX filter
+  const adxSeries = calcADXSeries(candles);
+  let adxOk = true;
+  if (adxSeries.length >= 4) {
+    const adxNow  = adxSeries[adxSeries.length - 1].adx;
+    if (ADX_MODE === 'threshold') {
+      adxOk = adxNow >= ADX_THRESHOLD;
+    } else {
+      // rising: ADX now > ADX 3 candles ago (momentum building)
+      const adxPrev = adxSeries[adxSeries.length - 4].adx;
+      adxOk = adxNow > adxPrev;
+    }
+  }
+
   const goldenCross = ema20p <= ema50p && ema20 > ema50;
   const deathCross  = ema20p >= ema50p && ema20 < ema50;
-
-  // Macro filter
   const macroUp   = price > ema200;
   const macroDown = price < ema200;
 
   let direction = null;
-  if (goldenCross && macroUp   && volOk) direction = 'bullish';
-  if (deathCross  && macroDown && volOk) direction = 'bearish';
+  if (goldenCross && macroUp   && volOk && adxOk) direction = 'bullish';
+  if (deathCross  && macroDown && volOk && adxOk) direction = 'bearish';
   if (!direction) return null;
 
-  // BTC Master Filter (skip for BTC itself)
   if (btcDirection !== null) {
     if (direction === 'bullish' && btcDirection === 'bearish') return null;
     if (direction === 'bearish' && btcDirection === 'bullish') return null;
   }
 
-  // Trade levels
   const atr    = calcATR(candles) ?? price * 0.02;
   const lows20  = candles.slice(-20).map(c => c.low);
   const highs20 = candles.slice(-20).map(c => c.high);
@@ -99,10 +123,6 @@ function analyze(candles, btcDirection) {
   }
 }
 
-// Get BTC direction at a given candle index (uses full BTC candle array)
-// BTC master filter: simple macro check — price vs EMA200
-// LONG altcoins only when BTC price > EMA200 (bull market)
-// SHORT altcoins only when BTC price < EMA200 (bear market)
 function getBtcDirection(btcCandles, idx) {
   if (!btcCandles || idx < LOOKBACK) return null;
   const closes = btcCandles.slice(0, idx + 1).map(c => c.close);
@@ -124,13 +144,12 @@ async function backtestCoin(symbol, btcCandles) {
   const trades = [];
   let lastSignalIdx = -COOLDOWN;
   let activeTrade   = null;
-  let tp1Hit        = false;
 
   for (let i = LOOKBACK; i < candles.length; i++) {
     const c = candles[i];
 
     if (activeTrade) {
-      const { direction, sl, tp1, tp2, entry, beHit } = activeTrade;
+      const { direction, sl, tp1, tp2, entry } = activeTrade;
 
       if (direction === 'bullish') {
         if (c.high >= tp2) {
@@ -139,11 +158,10 @@ async function backtestCoin(symbol, btcCandles) {
         }
         if (!activeTrade.tp1Hit && c.high >= tp1) {
           activeTrade.tp1Hit = true;
-          activeTrade.sl     = entry; // move SL to break-even
+          activeTrade.sl     = entry;
           continue;
         }
         if (c.low <= activeTrade.sl) {
-          // BE: half out at TP1 (+2R×0.5=+1R) + half at entry (0R) = +1R total
           const r = activeTrade.tp1Hit ? 1.0 : -1;
           trades.push({ symbol, direction, result: activeTrade.tp1Hit ? 'be' : 'sl', r, entry });
           activeTrade = null; continue;
@@ -181,11 +199,13 @@ async function backtestCoin(symbol, btcCandles) {
 }
 
 async function main() {
-  console.log('MarketLens Backtest v5 — EMA Cross + All Filters');
-  console.log('Filters: EMA200 macro | BTC price>EMA200 master | Volume 1.0x');
-  console.log('Exits:   TP1=2R, TP2=4R | SL=ATR×1.5 | BE=+0.75R | 4h\n');
+  const modeLabel = ADX_MODE === 'threshold'
+    ? `ADX(14) >= ${ADX_THRESHOLD}`
+    : 'ADX(14) steigend (rising momentum)';
+  console.log('MarketLens Backtest v6 — EMA Cross + ADX Filter');
+  console.log(`Filters: EMA200 macro | BTC master | Volume 1.0x | ${modeLabel}`);
+  console.log('Exits:   TP1=2R, TP2=4R | SL=ATR×1.5 | BE=+1.0R | 4h\n');
 
-  // Fetch BTC candles once for master filter
   let btcCandles = null;
   try {
     process.stdout.write('Fetching BTC candles for master filter... ');
@@ -236,7 +256,7 @@ async function main() {
   console.log(sep);
   console.log(`Trades:        ${tT} (Long:${allTrades.filter(x => x.direction === 'bullish').length} / Short:${allTrades.filter(x => x.direction === 'bearish').length})`);
   console.log(`Gewonnen:      ${tW} (TP1:${tTP1} / TP2:${tTP2})`);
-  console.log(`Break-Even:    ${tBE} (TP1 war drin, +1.0R each)`);
+  console.log(`Break-Even:    ${tBE} (+1.0R each)`);
   console.log(`Verloren:      ${tL}`);
   console.log(`Trefferquote:  ${wr}%  (nur TP1/TP2 = Win)`);
   console.log(`Gesamt R:      ${tR >= 0 ? '+' : ''}${tR.toFixed(1)}R`);
@@ -260,4 +280,3 @@ async function main() {
 }
 
 main().catch(console.error);
-  

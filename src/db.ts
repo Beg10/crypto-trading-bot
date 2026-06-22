@@ -278,3 +278,34 @@ export async function getWeeklySignals(): Promise<SignalLogEntry[]> {
   if (error) throw new Error(`DB getWeeklySignals: ${error.message}`);
   return (data ?? []) as SignalLogEntry[];
 }
+
+// ─── User Positions (position tracker for /in command) ───────────────────────
+
+export interface UserPosition {
+  telegram_id: number;
+  symbol: string;
+  margin: number;
+  leverage: number;
+}
+
+export async function getUsersInPosition(symbol: string): Promise<UserPosition[]> {
+  const { data, error } = await supabase
+    .from('user_positions')
+    .select('telegram_id, symbol, margin, leverage')
+    .eq('symbol', symbol)
+    .eq('is_active', true);
+  if (error) {
+    console.error(`DB getUsersInPosition: ${error.message}`);
+    return [];
+  }
+  return (data ?? []) as UserPosition[];
+}
+
+export async function closeUserPositions(symbol: string): Promise<void> {
+  const { error } = await supabase
+    .from('user_positions')
+    .update({ is_active: false })
+    .eq('symbol', symbol)
+    .eq('is_active', true);
+  if (error) console.error(`DB closeUserPositions: ${error.message}`);
+}
