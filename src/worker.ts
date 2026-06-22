@@ -18,6 +18,7 @@ import {
   upsertNewsItems,
   logSignal,
   closeSignal,
+  markTp1Hit,
   getActiveSignals,
   getUsersInPosition,
   closeUserPositions,
@@ -346,7 +347,7 @@ async function sendPersonalPnl(
 
     // Close positions in DB after TP2 or SL
     if (reason === 'tp2' || reason === 'sl') {
-      await closeUserPositions(trade.symbol);
+      await closeUserPositions(trade.symbol, 0);
     }
 
     for (const pos of positions) {
@@ -702,10 +703,96 @@ async function checkMorningBriefing(): Promise<void> {
   }
 }
 
+// ─── Exit Monitor — TP1 / TP2 / SL / BE Checks ──────────────────────────────
+
+async function checkExits(): Promise<void> {
+  let actives: import('./db').SignalLogEntry[];
+  try { actives = await getActiveSignals(); }
+  catch { return; }
+  if (actives.length === 0) return;
+
+  for (const sig of actives) {
+    try {
+      const candles = await getCandles(sig.symbol, '15m', 2);
+      if (!candles || candles.length === 0) continue;
+      const latest   = candles[candles.length - 1];
+      const high      = latest.high;
+      const low       = latest.low;
+      const isLong    = sig.direction === 'bullish';
+      const tp1       = sig.take_profit1;
+      const tp2       = sig.take_profit2;
+      const sl        = sig.stop_loss;
+      const entry     = sig.entry;
+      const tp1HitAt  = sig.tp1_hit_at;
+
+      // ── TP2 check ────────────────────────────────────────────────────────
+      if ((isLong && high >= tp2) || (!isLong && low <= tp2)) {
+        await closeSignal(sig.id, 'tp2', tp2, 3.0);
+        const coin = sig.symbol.replace('USDT', '');
+        const dir  = isLong ? '🟢 LONG' : '🔴 SHORT';
+        const msg =
+          `🏆 *TP2 erreicht — ${coin}* ${dir}\n\n` +
+          `✅ *Alles rausnehmen!* Position vollständig schließen.\n\n` +
+          `💰 Ergebnis: *+3R Gesamt*\n` +
+          `   (½ bei TP1 +2R + ½ bei TP2 +4R = Ø +3R)\n\n` +
+          `Entry: ${entry} → TP2: ${tp2}`;
+        await sendToChannel(msg);
+        continue;
+      }
+
+      // ── TP1 check (nur wenn noch nicht getroffen) ────────────────────────
+      if (!tp1HitAt && ((isLong && high >= tp1) || (!isLong && low <= tp1))) {
+        await markTp1Hit(sig.id);
+        const coin = sig.symbol.replace('USDT', '');
+        const dir  = isLong ? '🟢 LONG' : '🔴 SHORT';
+        const msg =
+          `🎯 *TP1 erreicht — ${coin}* ${dir}\n\n` +
+          `💡 *Empfehlung:* Hälfte der Position schließen (+2R gesichert).\n` +
+          `   Stop Loss auf *Break-Even (${entry})* verschieben.\n\n` +
+          `🎯 Nächstes Ziel: TP2 @ *${tp2}* (+4R)\n` +
+          `📊 Rest läuft risikofrei weiter.`;
+        await sendToChannel(msg);
+        continue;
+      }
+
+      // ── SL / BE check ────────────────────────────────────────────────────
+      const effectiveSl = tp1HitAt ? entry : sl; // nach TP1 → SL auf Entry
+      if ((isLong && low <= effectiveSl) || (!isLong && high >= effectiveSl)) {
+        if (tp1HitAt) {
+          // Break-Even: TP1 war schon getroffen, SL war auf Entry
+          await closeSignal(sig.id, 'be', effectiveSl, 1.0);
+          const coin = sig.symbol.replace('USDT', '');
+          const dir  = isLong ? '🟢 LONG' : '🔴 SHORT';
+          const msg =
+            `⚪ *Break-Even — ${coin}* ${dir}\n\n` +
+            `SL wurde nach TP1 auf Entry gesetzt — kein Verlust.\n` +
+            `💰 Ergebnis: *+1R* (TP1 Hälfte gesichert)\n\n` +
+            `Nächste Chance kommt. 📈`;
+          await sendToChannel(msg);
+        } else {
+          // Normaler SL
+          await closeSignal(sig.id, 'sl', effectiveSl, -1.0);
+          const coin = sig.symbol.replace('USDT', '');
+          const dir  = isLong ? '🟢 LONG' : '🔴 SHORT';
+          const msg =
+            `🛑 *Stop Loss — ${coin}* ${dir}\n\n` +
+            `Position wurde gestoppt.\n` +
+            `💸 Ergebnis: *-1R*\n\n` +
+            `Kein Problem — Verluste gehören dazu. Nächstes Signal kommt. 💪`;
+          await sendToChannel(msg);
+        }
+      }
+    } catch (e) {
+      console.error(`[exits] Error checking ${sig.symbol}:`, (e as Error).message);
+    }
+  }
+}
+
 // ─── Tick ─────────────────────────────────────────────────────────────────────
 
 async function tick(): Promise<void> {
   await Promise.allSettled([runAnalysis(), runNewsPipeline()]);
+  await checkExits();
   await checkDailyRecap();
   await checkMorningBriefing();
   await checkBtcMacroShift();

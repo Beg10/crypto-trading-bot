@@ -167,6 +167,8 @@ export interface SignalLogEntry {
   stop_loss: number;
   take_profit1: number;
   take_profit2: number;
+  take_profit3: number | null;
+  take_profit4: number | null;
   risk_reward: number | null;
   signals: string[];
   ema50: number | null;
@@ -176,6 +178,7 @@ export interface SignalLogEntry {
   close_reason: string | null;
   close_price: number | null;
   result_r: number | null;
+  tp1_hit_at: string | null;
 }
 
 export async function logSignal(data: {
@@ -215,6 +218,14 @@ export async function closeSignal(
     })
     .eq('id', id);
   if (error) throw new Error(`DB closeSignal: ${error.message}`);
+}
+
+export async function markTp1Hit(id: string): Promise<void> {
+  const { error } = await supabase
+    .from('signal_log')
+    .update({ tp1_hit_at: new Date().toISOString() })
+    .eq('id', id);
+  if (error) throw new Error(`DB markTp1Hit: ${error.message}`);
 }
 
 export async function getActiveSignals(): Promise<SignalLogEntry[]> {
@@ -301,11 +312,14 @@ export async function getUsersInPosition(symbol: string): Promise<UserPosition[]
   return (data ?? []) as UserPosition[];
 }
 
-export async function closeUserPositions(symbol: string): Promise<void> {
-  const { error } = await supabase
+
+export async function closeUserPositions(symbol: string, telegramId: number): Promise<void> {
+  let query = supabase
     .from('user_positions')
-    .update({ is_active: false })
+    .update({ is_active: false, closed_at: new Date().toISOString() })
     .eq('symbol', symbol)
     .eq('is_active', true);
-  if (error) console.error(`DB closeUserPositions: ${error.message}`);
+  if (telegramId !== 0) query = query.eq('telegram_id', telegramId);
+  const { error } = await query;
+  if (error) throw new Error(`DB closeUserPositions: ${error.message}`);
 }
