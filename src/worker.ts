@@ -39,8 +39,8 @@ const INTERVAL_MS = (parseInt(process.env.WORKER_INTERVAL_MINUTES ?? '5', 10)) *
 // ─── Channel config ───────────────────────────────────────────────────────────
 const CHANNEL_ID: string | null = process.env.CHANNEL_ID ?? null;
 // Best performing coins from backtest analysis (EMA cross strategy)
-// Coins monitored in channel (BTC serves as both signal + master-filter anchor)
-const CHANNEL_SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'XRPUSDT', 'LTCUSDT', 'BNBUSDT', 'ATOMUSDT', 'SOLUSDT'];
+// BTC is master filter only — not traded as signal (weak backtest)
+const CHANNEL_SYMBOLS = ['ETHUSDT', 'XRPUSDT', 'LTCUSDT', 'BNBUSDT', 'ATOMUSDT', 'SOLUSDT'];
 
 // ─── Daily recap tracking ────────────────────────────────────────────────────
 let lastRecapDate = '';
