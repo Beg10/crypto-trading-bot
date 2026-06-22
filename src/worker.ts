@@ -41,7 +41,7 @@ const INTERVAL_MS = (parseInt(process.env.WORKER_INTERVAL_MINUTES ?? '5', 10)) *
 
 // ─── Channel config ───────────────────────────────────────────────────────────
 const CHANNEL_ID: string | null = process.env.CHANNEL_ID ?? null;
-const CHANNEL_SYMBOLS = ['ETHUSDT', 'XRPUSDT', 'LTCUSDT', 'BNBUSDT', 'ATOMUSDT', 'SOLUSDT', 'AVAXUSDT'];
+const CHANNEL_SYMBOLS = ['ETHUSDT', 'XRPUSDT', 'LTCUSDT', 'BNBUSDT', 'ATOMUSDT', 'SOLUSDT', 'LINKUSDT'];
 
 // ─── Tracking ────────────────────────────────────────────────────────────────
 let lastRecapDate    = '';

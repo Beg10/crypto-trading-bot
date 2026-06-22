@@ -1,5 +1,5 @@
 const axios = require('axios');
-const { EMA, ATR, ADX } = require('technicalindicators');
+const { EMA, ATR, ADX, RSI } = require('technicalindicators');
 
 // ── Config ─────────────────────────────────────────────────────────────────────
 const COINS         = ['BTCUSDT', 'ETHUSDT', 'XRPUSDT', 'LTCUSDT', 'BNBUSDT', 'ATOMUSDT', 'SOLUSDT', 'AVAXUSDT', 'LINKUSDT', 'DOTUSDT', 'ADAUSDT'];
@@ -11,14 +11,31 @@ const TP2_R         = 4.0;
 const COOLDOWN      = 6;
 const LOOKBACK      = 210;
 const ADX_PERIOD    = 14;
+const RSI_PERIOD    = 14;
+const RSI_LONG_MAX  = 65;   // don't enter LONG if RSI >= this (overbought)
+const RSI_SHORT_MIN = 35;   // don't enter SHORT if RSI <= this (oversold)
 
-async function fetchCandles(symbol, interval = '4h', limit = 1000) {
-  const res = await axios.get('https://api.binance.com/api/v3/klines', {
-    params: { symbol, interval, limit }, timeout: 15000,
-  });
-  return res.data.map(k => ({
-    openTime: k[0], open: +k[1], high: +k[2], low: +k[3], close: +k[4], volume: +k[5],
-  }));
+async function fetchCandles(symbol, interval = '4h', totalLimit = 3000) {
+  const maxPerReq = 1000;
+  let allCandles = [];
+  let endTime = undefined;
+
+  while (allCandles.length < totalLimit) {
+    const limit = Math.min(maxPerReq, totalLimit - allCandles.length);
+    const params = { symbol, interval, limit };
+    if (endTime) params.endTime = endTime;
+    const res = await axios.get('https://api.binance.com/api/v3/klines', {
+      params, timeout: 15000,
+    });
+    if (!res.data || res.data.length === 0) break;
+    const batch = res.data.map(k => ({
+      openTime: k[0], open: +k[1], high: +k[2], low: +k[3], close: +k[4], volume: +k[5],
+    }));
+    allCandles = [...batch, ...allCandles];
+    endTime = res.data[0][0] - 1; // go further back in time
+    if (res.data.length < limit) break;
+  }
+  return allCandles;
 }
 
 function calcEMASeries(closes, period) {
@@ -50,6 +67,12 @@ function calcVolumeRatio(candles, period = 20) {
   const past = candles.slice(-period - 1, -1).map(c => c.volume);
   const avg  = past.reduce((a, b) => a + b, 0) / past.length;
   return avg > 0 ? candles[candles.length - 1].volume / avg : null;
+}
+
+function calcRSILast(closes, period = RSI_PERIOD) {
+  if (closes.length < period + 1) return null;
+  const vals = RSI.calculate({ values: closes, period });
+  return vals.length > 0 ? vals[vals.length - 1] : null;
 }
 
 function isAdxRisingAt(adxSeries, idx) {
@@ -86,6 +109,10 @@ function analyze(candles, btcDirection) {
   const deathCross  = ema20p >= ema50p && ema20 < ema50;
   const macroUp     = price > ema200;
   const macroDown   = price < ema200;
+
+  const rsi    = calcRSILast(closes);
+  const rsiOkL = rsi === null || rsi < RSI_LONG_MAX;   // not overbought for longs
+  const rsiOkS = rsi === null || rsi > RSI_SHORT_MIN;  // not oversold for shorts
 
   let direction = null;
   if (goldenCross && macroUp   && volOk && adxOk) direction = 'bullish';
@@ -214,7 +241,7 @@ async function backtestCoin(symbol, btcCandles) {
 }
 
 async function main() {
-  console.log('MarketLens Backtest v6 — ADX Rising + Hard TP2');
+  console.log('MarketLens Backtest v6 auf 3000 Kerzen — ADX Rising, kein RSI  (~500 Tage)');
   console.log('Filters:  EMA200 macro | BTC master | Volume 1.0x | ADX rising');
   console.log('Exits:    TP1=2R (half out, SL→BE) → TP2=4R (full close) = +3R total\n');
 
@@ -266,7 +293,7 @@ async function main() {
   const maxR = allTrades.length > 0 ? Math.max(...allTrades.map(x => x.r)).toFixed(1) : '–';
 
   console.log('\n' + sep);
-  console.log('  GESAMT v6 (ADX Rising, Hard TP2)');
+  console.log('  GESAMT v6 auf 3000 Kerzen (kein RSI)');
   console.log(sep);
   console.log(`Trades:        ${tT} (Long:${allTrades.filter(x => x.direction === 'bullish').length} / Short:${allTrades.filter(x => x.direction === 'bearish').length})`);
   console.log(`TP2 (+3R):     ${tTP2}`);
@@ -277,7 +304,7 @@ async function main() {
   console.log(`Gesamt R:      ${tR >= 0 ? '+' : ''}${tR.toFixed(1)}R`);
   console.log(`Ø pro Trade:   ${avg}R`);
   console.log(`Bester Trade:  ${maxR}R`);
-  console.log('\n  Vergleich: v6 (BE+TP2) = +11R | v7 (Trail EMA20) = +8.7R');
+  console.log('\n  Merke diesen Wert für v6-Vergleich: ' + (tR >= 0 ? '+' : '') + tR.toFixed(1) + 'R bei ' + tT + ' Trades');
 
   const sorted = [...coinResults].sort((a, b) => b.totalR - a.totalR);
   console.log('\n  RANKING');
