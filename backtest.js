@@ -3,7 +3,7 @@ const { EMA, ATR } = require('technicalindicators');
 
 // ── Config — must match src/services/analysis.ts exactly ──────────────────────
 const COINS = ['BTCUSDT', 'ETHUSDT', 'XRPUSDT', 'LTCUSDT', 'BNBUSDT', 'ATOMUSDT', 'SOLUSDT'];
-const VOL_THRESHOLD   = 1.2;   // volume >= 1.2x average
+const VOL_THRESHOLD   = 1.0;   // volume >= 1.2x average
 const SPREAD_MIN      = 0.003; // EMA20-EMA50 spread >= 0.3% of price
 const SL_ATR_MULT     = 1.5;
 const MAX_SL_PCT      = 0.08;
@@ -62,10 +62,6 @@ function analyze(candles, btcDirection) {
   const volRatio = calcVolumeRatio(candles);
   const volOk    = volRatio === null || volRatio >= VOL_THRESHOLD;
 
-  // EMA spread filter — prevents micro-crosses in choppy markets
-  const spread   = Math.abs(ema20 - ema50) / price;
-  const spreadOk = spread >= SPREAD_MIN;
-
   // Cross detection
   const goldenCross = ema20p <= ema50p && ema20 > ema50;
   const deathCross  = ema20p >= ema50p && ema20 < ema50;
@@ -75,8 +71,8 @@ function analyze(candles, btcDirection) {
   const macroDown = price < ema200;
 
   let direction = null;
-  if (goldenCross && macroUp   && volOk && spreadOk) direction = 'bullish';
-  if (deathCross  && macroDown && volOk && spreadOk) direction = 'bearish';
+  if (goldenCross && macroUp   && volOk) direction = 'bullish';
+  if (deathCross  && macroDown && volOk) direction = 'bearish';
   if (!direction) return null;
 
   // BTC Master Filter (skip for BTC itself)
@@ -104,28 +100,19 @@ function analyze(candles, btcDirection) {
 }
 
 // Get BTC direction at a given candle index (uses full BTC candle array)
+// BTC master filter: simple macro check — price vs EMA200
+// LONG altcoins only when BTC price > EMA200 (bull market)
+// SHORT altcoins only when BTC price < EMA200 (bear market)
 function getBtcDirection(btcCandles, idx) {
   if (!btcCandles || idx < LOOKBACK) return null;
-  const slice  = btcCandles.slice(0, idx + 1);
-  const closes = slice.map(c => c.close);
+  const closes = btcCandles.slice(0, idx + 1).map(c => c.close);
   const price  = closes[closes.length - 1];
-  const ema20s  = calcEMASeries(closes, 20);
-  const ema50s  = calcEMASeries(closes, 50);
   const ema200s = calcEMASeries(closes, 200);
-  if (ema20s.length < 2 || ema50s.length < 2 || ema200s.length < 1) return null;
-  const ema20  = ema20s[ema20s.length - 1];
-  const ema20p = ema20s[ema20s.length - 2];
-  const ema50  = ema50s[ema50s.length - 1];
-  const ema50p = ema50s[ema50s.length - 2];
+  if (ema200s.length < 1) return null;
   const ema200 = ema200s[ema200s.length - 1];
-  const goldenCross = ema20p <= ema50p && ema20 > ema50;
-  const deathCross  = ema20p >= ema50p && ema20 < ema50;
-  if (goldenCross && price > ema200) return 'bullish';
-  if (deathCross  && price < ema200) return 'bearish';
-  // Between crosses: use current EMA alignment as proxy
-  if (ema20 > ema50 && price > ema200) return 'bullish';
-  if (ema20 < ema50 && price < ema200) return 'bearish';
-  return null; // neutral
+  if (price > ema200) return 'bullish';
+  if (price < ema200) return 'bearish';
+  return null;
 }
 
 async function backtestCoin(symbol, btcCandles) {
@@ -195,7 +182,7 @@ async function backtestCoin(symbol, btcCandles) {
 
 async function main() {
   console.log('MarketLens Backtest v5 — EMA Cross + All Filters');
-  console.log('Filters: EMA200 macro | BTC master | Spread 0.3% | Volume 1.2x');
+  console.log('Filters: EMA200 macro | BTC price>EMA200 master | Volume 1.0x');
   console.log('Exits:   TP1=2R, TP2=4R | SL=ATR×1.5 | BE=+0.75R | 4h\n');
 
   // Fetch BTC candles once for master filter
