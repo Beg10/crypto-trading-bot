@@ -2,21 +2,15 @@ const axios = require('axios');
 const { EMA, ATR, ADX } = require('technicalindicators');
 
 // ── Config ─────────────────────────────────────────────────────────────────────
-const COINS = ['BTCUSDT', 'ETHUSDT', 'XRPUSDT', 'LTCUSDT', 'BNBUSDT', 'ATOMUSDT', 'SOLUSDT'];
-const VOL_THRESHOLD   = 1.0;
-const SL_ATR_MULT     = 1.5;
-const MAX_SL_PCT      = 0.08;
-const TP1_R           = 2.0;
-const TP2_R           = 4.0;
-const COOLDOWN        = 6;
-const LOOKBACK        = 210;
-const ADX_PERIOD      = 14;
-// Test both modes via env var:
-//   ADX_MODE=threshold node backtest.js  → ADX >= threshold
-//   ADX_MODE=rising    node backtest.js  → ADX rising over last 3 candles
-//   (default = rising)
-const ADX_MODE      = process.env.ADX_MODE || 'rising';
-const ADX_THRESHOLD = Number(process.env.ADX_MIN || 20);
+const COINS         = ['BTCUSDT', 'ETHUSDT', 'XRPUSDT', 'LTCUSDT', 'BNBUSDT', 'ATOMUSDT', 'SOLUSDT', 'AVAXUSDT', 'LINKUSDT', 'DOTUSDT', 'ADAUSDT'];
+const VOL_THRESHOLD = 1.0;
+const SL_ATR_MULT   = 1.5;
+const MAX_SL_PCT    = 0.08;
+const TP1_R         = 2.0;
+const TP2_R         = 4.0;
+const COOLDOWN      = 6;
+const LOOKBACK      = 210;
+const ADX_PERIOD    = 14;
 
 async function fetchCandles(symbol, interval = '4h', limit = 1000) {
   const res = await axios.get('https://api.binance.com/api/v3/klines', {
@@ -54,8 +48,13 @@ function calcADXSeries(candles, period = ADX_PERIOD) {
 function calcVolumeRatio(candles, period = 20) {
   if (candles.length < period + 1) return null;
   const past = candles.slice(-period - 1, -1).map(c => c.volume);
-  const avg = past.reduce((a, b) => a + b, 0) / past.length;
+  const avg  = past.reduce((a, b) => a + b, 0) / past.length;
   return avg > 0 ? candles[candles.length - 1].volume / avg : null;
+}
+
+function isAdxRisingAt(adxSeries, idx) {
+  if (idx < 3 || adxSeries.length <= idx) return false;
+  return adxSeries[idx].adx > adxSeries[idx - 3].adx;
 }
 
 function analyze(candles, btcDirection) {
@@ -77,24 +76,16 @@ function analyze(candles, btcDirection) {
   const volRatio = calcVolumeRatio(candles);
   const volOk    = volRatio === null || volRatio >= VOL_THRESHOLD;
 
-  // ADX filter
   const adxSeries = calcADXSeries(candles);
   let adxOk = true;
   if (adxSeries.length >= 4) {
-    const adxNow  = adxSeries[adxSeries.length - 1].adx;
-    if (ADX_MODE === 'threshold') {
-      adxOk = adxNow >= ADX_THRESHOLD;
-    } else {
-      // rising: ADX now > ADX 3 candles ago (momentum building)
-      const adxPrev = adxSeries[adxSeries.length - 4].adx;
-      adxOk = adxNow > adxPrev;
-    }
+    adxOk = adxSeries[adxSeries.length - 1].adx > adxSeries[adxSeries.length - 4].adx;
   }
 
   const goldenCross = ema20p <= ema50p && ema20 > ema50;
   const deathCross  = ema20p >= ema50p && ema20 < ema50;
-  const macroUp   = price > ema200;
-  const macroDown = price < ema200;
+  const macroUp     = price > ema200;
+  const macroDown   = price < ema200;
 
   let direction = null;
   if (goldenCross && macroUp   && volOk && adxOk) direction = 'bullish';
@@ -114,31 +105,37 @@ function analyze(candles, btcDirection) {
     const sl   = Math.max(Math.min(...lows20), price - atr * SL_ATR_MULT);
     const risk = price - sl;
     if (risk <= 0 || risk / price > MAX_SL_PCT) return null;
-    return { direction, entry: price, sl, tp1: price + risk * TP1_R, tp2: price + risk * TP2_R };
+    return { direction, entry: price, sl, risk,
+             tp1: price + risk * TP1_R, tp2: price + risk * TP2_R };
   } else {
     const sl   = Math.min(Math.max(...highs20), price + atr * SL_ATR_MULT);
     const risk = sl - price;
     if (risk <= 0 || risk / price > MAX_SL_PCT) return null;
-    return { direction, entry: price, sl, tp1: price - risk * TP1_R, tp2: price - risk * TP2_R };
+    return { direction, entry: price, sl, risk,
+             tp1: price - risk * TP1_R, tp2: price - risk * TP2_R };
   }
 }
 
 function getBtcDirection(btcCandles, idx) {
   if (!btcCandles || idx < LOOKBACK) return null;
   const closes = btcCandles.slice(0, idx + 1).map(c => c.close);
-  const price  = closes[closes.length - 1];
+  const price   = closes[closes.length - 1];
   const ema200s = calcEMASeries(closes, 200);
   if (ema200s.length < 1) return null;
   const ema200 = ema200s[ema200s.length - 1];
-  if (price > ema200) return 'bullish';
-  if (price < ema200) return 'bearish';
-  return null;
+  return price > ema200 ? 'bullish' : price < ema200 ? 'bearish' : null;
 }
 
 async function backtestCoin(symbol, btcCandles) {
   let candles;
   try { candles = await fetchCandles(symbol); }
   catch (e) { return { symbol, error: e.message, trades: [] }; }
+
+  const closes     = candles.map(c => c.close);
+  const ema20Full  = calcEMASeries(closes, 20);
+  const adxFull    = calcADXSeries(candles);
+  const ema20Off   = closes.length - ema20Full.length;
+  const adxOff     = candles.length - adxFull.length;
 
   const isBtc  = symbol === 'BTCUSDT';
   const trades = [];
@@ -147,39 +144,57 @@ async function backtestCoin(symbol, btcCandles) {
 
   for (let i = LOOKBACK; i < candles.length; i++) {
     const c = candles[i];
+    const ema20Now = ema20Full[i - ema20Off] ?? null;
+    const adxIdx   = i - adxOff;
 
     if (activeTrade) {
-      const { direction, sl, tp1, tp2, entry } = activeTrade;
+      const { direction, entry, sl, risk, tp1, tp2 } = activeTrade;
 
-      if (direction === 'bullish') {
-        if (c.high >= tp2) {
-          trades.push({ symbol, direction, result: 'tp2', r: 3.0, entry });
-          activeTrade = null; continue;
+      // ── Phase 1: before TP1 ───────────────────────────────────────────────
+      if (!activeTrade.tp1Hit) {
+        if (direction === 'bullish') {
+          if (c.low <= sl) {
+            trades.push({ symbol, direction, result: 'sl', r: -1, entry });
+            activeTrade = null; continue;
+          }
+          if (c.high >= tp1) {
+            activeTrade.tp1Hit = true;
+            activeTrade.sl     = entry; // move SL to break-even
+          }
+        } else {
+          if (c.high >= sl) {
+            trades.push({ symbol, direction, result: 'sl', r: -1, entry });
+            activeTrade = null; continue;
+          }
+          if (c.low <= tp1) {
+            activeTrade.tp1Hit = true;
+            activeTrade.sl     = entry;
+          }
         }
-        if (!activeTrade.tp1Hit && c.high >= tp1) {
-          activeTrade.tp1Hit = true;
-          activeTrade.sl     = entry;
-          continue;
-        }
-        if (c.low <= activeTrade.sl) {
-          const r = activeTrade.tp1Hit ? 1.0 : -1;
-          trades.push({ symbol, direction, result: activeTrade.tp1Hit ? 'be' : 'sl', r, entry });
-          activeTrade = null; continue;
-        }
-      } else {
-        if (c.low <= tp2) {
-          trades.push({ symbol, direction, result: 'tp2', r: 3.0, entry });
-          activeTrade = null; continue;
-        }
-        if (!activeTrade.tp1Hit && c.low <= tp1) {
-          activeTrade.tp1Hit = true;
-          activeTrade.sl     = entry;
-          continue;
-        }
-        if (c.high >= activeTrade.sl) {
-          const r = activeTrade.tp1Hit ? 1.0 : -1;
-          trades.push({ symbol, direction, result: activeTrade.tp1Hit ? 'be' : 'sl', r, entry });
-          activeTrade = null; continue;
+      }
+
+      // ── Phase 2: between TP1 and TP2 (SL at BE) ──────────────────────────
+      else {
+        if (direction === 'bullish') {
+          if (c.high >= tp2) {
+            // TP2 hit: first half already exited at +2R, second half at +4R → total +3R
+            trades.push({ symbol, direction, result: 'tp2', r: 3.0, entry });
+            activeTrade = null; continue;
+          }
+          if (c.low <= activeTrade.sl) {
+            // BE stop — first half at +2R, second half at 0 → total +1R
+            trades.push({ symbol, direction, result: 'be', r: 1.0, entry });
+            activeTrade = null; continue;
+          }
+        } else {
+          if (c.low <= tp2) {
+            trades.push({ symbol, direction, result: 'tp2', r: 3.0, entry });
+            activeTrade = null; continue;
+          }
+          if (c.high >= activeTrade.sl) {
+            trades.push({ symbol, direction, result: 'be', r: 1.0, entry });
+            activeTrade = null; continue;
+          }
         }
       }
       continue;
@@ -199,12 +214,9 @@ async function backtestCoin(symbol, btcCandles) {
 }
 
 async function main() {
-  const modeLabel = ADX_MODE === 'threshold'
-    ? `ADX(14) >= ${ADX_THRESHOLD}`
-    : 'ADX(14) steigend (rising momentum)';
-  console.log('MarketLens Backtest v6 — EMA Cross + ADX Filter');
-  console.log(`Filters: EMA200 macro | BTC master | Volume 1.0x | ${modeLabel}`);
-  console.log('Exits:   TP1=2R, TP2=4R | SL=ATR×1.5 | BE=+1.0R | 4h\n');
+  console.log('MarketLens Backtest v6 — ADX Rising + Hard TP2');
+  console.log('Filters:  EMA200 macro | BTC master | Volume 1.0x | ADX rising');
+  console.log('Exits:    TP1=2R (half out, SL→BE) → TP2=4R (full close) = +3R total\n');
 
   let btcCandles = null;
   try {
@@ -212,7 +224,7 @@ async function main() {
     btcCandles = await fetchCandles('BTCUSDT');
     console.log('OK\n');
   } catch (e) {
-    console.log(`FEHLER: ${e.message} — running without BTC filter\n`);
+    console.log(`FEHLER: ${e.message}\n`);
   }
 
   const allTrades = [], coinResults = [];
@@ -224,43 +236,48 @@ async function main() {
     const t      = res.trades;
     const longs  = t.filter(x => x.direction === 'bullish').length;
     const shorts = t.filter(x => x.direction === 'bearish').length;
-    const wins   = t.filter(x => x.result === 'tp1' || x.result === 'tp2').length;
-    const tp1w   = t.filter(x => x.result === 'tp1').length;
-    const tp2w   = t.filter(x => x.result === 'tp2').length;
-    const be     = t.filter(x => x.result === 'be').length;
+    const tp2s   = t.filter(x => x.result === 'tp2').length;
+    const trails = t.filter(x => x.result === 'trail').length;
+    const bes    = t.filter(x => x.result === 'be').length;
     const losses = t.filter(x => x.result === 'sl').length;
     const totalR = t.reduce((s, x) => s + x.r, 0);
+    const wins   = tp2s;
     const wr     = t.length > 0 ? Math.round(wins / t.length * 100) : 0;
+    const maxR   = t.length > 0 ? Math.max(...t.map(x => x.r)).toFixed(1) : '–';
     console.log(
       `${String(t.length).padStart(3)}T (L:${longs}/S:${shorts}) | ` +
-      `${wins}W(TP1:${tp1w} TP2:${tp2w}) ${be}BE ${losses}L | ` +
-      `${totalR >= 0 ? '+' : ''}${totalR.toFixed(1)}R | WR:${wr}%`
+      `${tp2s}TP2 ${trails}Trail ${bes}BE ${losses}SL | ` +
+      `${totalR >= 0 ? '+' : ''}${totalR.toFixed(1)}R | WR:${wr}% | max:${maxR}R`
     );
-    coinResults.push({ symbol: coin, trades: t.length, wins, losses, be, totalR, wr });
+    coinResults.push({ symbol: coin, trades: t.length, wins, tp2s, trails, bes, losses, totalR, wr });
     allTrades.push(...t);
   }
 
-  const sep  = '═'.repeat(65);
+  const sep  = '═'.repeat(70);
   const tT   = allTrades.length;
-  const tW   = allTrades.filter(x => x.result === 'tp1' || x.result === 'tp2').length;
-  const tTP1 = allTrades.filter(x => x.result === 'tp1').length;
   const tTP2 = allTrades.filter(x => x.result === 'tp2').length;
+  const tTr  = allTrades.filter(x => x.result === 'trail').length;
   const tBE  = allTrades.filter(x => x.result === 'be').length;
   const tL   = allTrades.filter(x => x.result === 'sl').length;
   const tR   = allTrades.reduce((s, x) => s + x.r, 0);
+  const tW   = tTP2;
   const wr   = tT > 0 ? (tW / tT * 100).toFixed(1) : 0;
   const avg  = tT > 0 ? (tR / tT).toFixed(2) : 0;
+  const maxR = allTrades.length > 0 ? Math.max(...allTrades.map(x => x.r)).toFixed(1) : '–';
 
   console.log('\n' + sep);
-  console.log('  GESAMT');
+  console.log('  GESAMT v6 (ADX Rising, Hard TP2)');
   console.log(sep);
   console.log(`Trades:        ${tT} (Long:${allTrades.filter(x => x.direction === 'bullish').length} / Short:${allTrades.filter(x => x.direction === 'bearish').length})`);
-  console.log(`Gewonnen:      ${tW} (TP1:${tTP1} / TP2:${tTP2})`);
-  console.log(`Break-Even:    ${tBE} (+1.0R each)`);
-  console.log(`Verloren:      ${tL}`);
-  console.log(`Trefferquote:  ${wr}%  (nur TP1/TP2 = Win)`);
+  console.log(`TP2 (+3R):     ${tTP2}`);
+  console.log(`Break-Even:    ${tBE}  (+1R)`);
+  console.log(`Stop Loss:     ${tL}  (-1R)`);
+  console.log(`Verloren:      ${tL}  (-1R)`);
+  console.log(`Trefferquote:  ${wr}%`);
   console.log(`Gesamt R:      ${tR >= 0 ? '+' : ''}${tR.toFixed(1)}R`);
   console.log(`Ø pro Trade:   ${avg}R`);
+  console.log(`Bester Trade:  ${maxR}R`);
+  console.log('\n  Vergleich: v6 (BE+TP2) = +11R | v7 (Trail EMA20) = +8.7R');
 
   const sorted = [...coinResults].sort((a, b) => b.totalR - a.totalR);
   console.log('\n  RANKING');
@@ -268,12 +285,12 @@ async function main() {
   for (const c of sorted) {
     const rStr = (c.totalR >= 0 ? '+' : '') + c.totalR.toFixed(1) + 'R';
     const bar  = c.totalR > 0
-      ? '█'.repeat(Math.min(Math.round(c.totalR), 20))
+      ? '█'.repeat(Math.min(Math.round(c.totalR), 25))
       : '▓'.repeat(Math.min(Math.round(-c.totalR), 10));
     console.log(
       `${c.symbol.replace('USDT','').padEnd(6)} ` +
       `${rStr.padStart(7)}  WR:${String(c.wr + '%').padStart(4)}  ` +
-      `${c.trades}T (${c.wins}W/${c.be}BE/${c.losses}L)  ${bar}`
+      `${c.trades}T (${c.tp2s}TP2/${c.trails}Trail/${c.bes}BE/${c.losses}SL)  ${bar}`
     );
   }
   console.log(sep);

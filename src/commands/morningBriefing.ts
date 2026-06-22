@@ -7,7 +7,7 @@ import { Bot } from 'grammy';
 import { getCandles } from '../services/binance';
 import { EMA, ADX } from 'technicalindicators';
 
-const BRIEFING_COINS = ['BTCUSDT', 'ETHUSDT', 'XRPUSDT', 'LTCUSDT', 'BNBUSDT', 'ATOMUSDT', 'SOLUSDT'];
+const BRIEFING_COINS = ['BTCUSDT', 'ETHUSDT', 'XRPUSDT', 'LTCUSDT', 'BNBUSDT', 'ATOMUSDT', 'SOLUSDT', 'AVAXUSDT'];
 
 interface CoinStatus {
   symbol:     string;
