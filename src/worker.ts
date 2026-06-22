@@ -168,6 +168,21 @@ function buildEntryMessage(result: AnalysisResult, capital: number | null = null
     }
   }
 
+  // Confluence score bar
+  let confluenceLine = '';
+  if (result.confluenceScore !== null) {
+    const s = result.confluenceScore;
+    const filled  = Math.round(s / 10);
+    const empty   = 10 - filled;
+    const bar     = '█'.repeat(filled) + '░'.repeat(empty);
+    const label   = s >= 80 ? '🔥 SEHR STARK'
+                  : s >= 60 ? '🟢 STARK'
+                  : s >= 40 ? '🟡 MITTEL'
+                  : s >= 20 ? '🟠 SCHWACH'
+                  :           '⚠️ GERING';
+    confluenceLine = `\n🎯 *Confluence Score: ${s}/100* ${label}\n\`${bar}\`\n`;
+  }
+
   return (
     `⚡ *Signal — ${result.symbol}* · 4h · ${nowUTC()}\n\n` +
     `${dirLine}\n` +
@@ -175,6 +190,7 @@ function buildEntryMessage(result: AnalysisResult, capital: number | null = null
     tradeLevels +
     positionLine +
     moneyLines +
+    confluenceLine +
     `\n📈 *Signale:*\n${allSignals}\n\n` +
     `${tradeLinks(result.symbol)}\n\n` +
     `_⚠️ Kein Finanzrat. Auf eigenes Risiko._`

@@ -65,6 +65,8 @@ export interface AnalysisResult {
   stochRsiK: number | null;
   stochRsiD: number | null;
   divergence: 'bullish' | 'bearish' | null;
+  confluenceScore: number | null; // 0-100
+  confluenceBreakdown: string[];   // explanation lines
 }
 
 export interface CoinMarketData {

@@ -78,6 +78,93 @@ function calcTradeLevels(candles: Candle[], direction: 'bullish' | 'bearish'): T
   }
 }
 
+
+// ─── Confluence Score (0–100) ─────────────────────────────────────────────────
+// Measures signal quality across 4 independent factors:
+//   Volume (30) | EMA200 distance (25) | EMA20 slope (25) | Pattern clarity (20)
+
+function calcConfluenceScore(
+  candles: Candle[],
+  ema20Series: number[],
+  ema50Series: number[],
+  ema200: number | null,
+  volumeRatio: number | null,
+  direction: 'bullish' | 'bearish',
+): { score: number; breakdown: string[] } {
+  const closes = candles.map((c) => c.close);
+  const price  = closes[closes.length - 1];
+  let score    = 0;
+  const breakdown: string[] = [];
+
+  // ── 1. Volume (0–30 pts) ──────────────────────────────────────────────────
+  const vr = volumeRatio ?? 1.0;
+  let volPts = 0;
+  if (vr >= 3.0)      volPts = 30;
+  else if (vr >= 2.0) volPts = 22;
+  else if (vr >= 1.5) volPts = 14;
+  else if (vr >= 1.0) volPts = 7;
+  score += volPts;
+  breakdown.push(`Vol ${vr.toFixed(1)}x avg → ${volPts}/30`);
+
+  // ── 2. EMA200 distance (0–25 pts) ────────────────────────────────────────
+  // How far is price from EMA200? Farther = cleaner macro trend
+  let ema200Pts = 0;
+  if (ema200 !== null) {
+    const dist = Math.abs(price - ema200) / price * 100;
+    if (dist >= 15)      ema200Pts = 25;
+    else if (dist >= 8)  ema200Pts = 18;
+    else if (dist >= 4)  ema200Pts = 12;
+    else if (dist >= 1)  ema200Pts = 6;
+    breakdown.push(`EMA200 Abstand ${dist.toFixed(1)}% → ${ema200Pts}/25`);
+  } else {
+    ema200Pts = 12; // no EMA200 data = neutral
+    breakdown.push(`EMA200 n/a → ${ema200Pts}/25`);
+  }
+  score += ema200Pts;
+
+  // ── 3. EMA20 slope (0–25 pts) ────────────────────────────────────────────
+  // How steeply is EMA20 moving? Steeper slope = stronger momentum
+  let slopePts = 0;
+  if (ema20Series.length >= 5) {
+    const ema20Now  = ema20Series[ema20Series.length - 1];
+    const ema20Five = ema20Series[ema20Series.length - 5];
+    const slopePct  = (ema20Now - ema20Five) / ema20Five * 100;
+    const abvSlope  = Math.abs(slopePct);
+    const correct   = direction === 'bullish' ? slopePct > 0 : slopePct < 0;
+    if (correct) {
+      if (abvSlope >= 2.0)      slopePts = 25;
+      else if (abvSlope >= 1.0) slopePts = 18;
+      else if (abvSlope >= 0.4) slopePts = 10;
+      else                       slopePts = 4;
+    }
+    breakdown.push(`EMA20 Slope ${slopePct >= 0 ? '+' : ''}${slopePct.toFixed(2)}% (5c) → ${slopePts}/25`);
+  }
+  score += slopePts;
+
+  // ── 4. EMA50 alignment clarity (0–20 pts) ────────────────────────────────
+  // How long was the previous opposite setup before this cross?
+  // More candles in prior trend = cleaner reversal
+  let alignPts = 0;
+  if (ema20Series.length >= 10 && ema50Series.length >= 10) {
+    let streak = 0;
+    for (let i = ema20Series.length - 2; i >= Math.max(0, ema20Series.length - 15); i--) {
+      const wasOpposite = direction === 'bullish'
+        ? ema20Series[i] <= ema50Series[i]
+        : ema20Series[i] >= ema50Series[i];
+      if (wasOpposite) streak++;
+      else break;
+    }
+    if (streak >= 8)      alignPts = 20;
+    else if (streak >= 5) alignPts = 14;
+    else if (streak >= 3) alignPts = 8;
+    else                   alignPts = 3;
+    breakdown.push(`Trend-Aufbau ${streak} Kerzen → ${alignPts}/20`);
+  }
+  score += alignPts;
+
+  return { score: Math.min(100, score), breakdown };
+}
+
 // ─── Main Analysis: EMA Cross Strategy ───────────────────────────────────────
 //
 // Signal fires when:
@@ -132,6 +219,12 @@ export function analyzeCandles(symbol: string, candles: Candle[]): AnalysisResul
     signals.push(`Volumen: ${volumeRatio.toFixed(2)}x Durchschnitt ${volumeRatio >= 1.0 ? '✅' : '⚠️'}`);
   }
 
+  // Confluence score (computed regardless of signal — shows setup quality)
+  const { score: confluenceScore, breakdown: confluenceBreakdown } =
+    direction !== null
+      ? calcConfluenceScore(candles, ema20Series, ema50Series, ema200, volumeRatio, direction)
+      : { score: null as unknown as number, breakdown: [] as string[] };
+
   let entry:       number | null = null;
   let stopLoss:    number | null = null;
   let takeProfit1: number | null = null;
@@ -165,6 +258,8 @@ export function analyzeCandles(symbol: string, candles: Candle[]): AnalysisResul
     stochRsiK:  null,
     stochRsiD:  null,
     divergence: null,
+    confluenceScore:     direction !== null ? confluenceScore : null,
+    confluenceBreakdown: direction !== null ? confluenceBreakdown : [],
   };
 }
 
