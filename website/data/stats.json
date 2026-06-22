@@ -1,0 +1,16 @@
+{
+  "lastUpdated": "2026-06-21T20:00:00.000Z",
+  "stats": {
+    "totalTrades": 0,
+    "wins": 0,
+    "losses": 0,
+    "breakEvens": 0,
+    "activeTrades": 0,
+    "winRate": 0,
+    "totalR": 0,
+    "avgR": 0
+  },
+  "recentSignals": [],
+  "coinStats": [],
+  "monthlyStats": []
+}

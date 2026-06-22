@@ -42,10 +42,11 @@ const INTERVAL_MS = (parseInt(process.env.WORKER_INTERVAL_MINUTES ?? '5', 10)) *
 // ─── Channel config ───────────────────────────────────────────────────────────
 const CHANNEL_ID: string | null = process.env.CHANNEL_ID ?? null;
 const CHANNEL_SYMBOLS = [
-  // Tier-1 validiert (Walk-Forward positiv, 500 Tage, >6 Trades)
-  'UNIUSDT', 'XRPUSDT', 'ETHUSDT', 'SOLUSDT', 'LINKUSDT',
-  'INJUSDT', 'ALGOUSDT', 'LTCUSDT', 'ADAUSDT', 'VETUSDT', 'AAVEUSDT',
-  'BNBUSDT',
+  // Tier-1: Original validierte 12 Coins (4h Walk-Forward +59R/111T)
+  'ETHUSDT', 'BNBUSDT', 'XRPUSDT', 'SOLUSDT', 'LINKUSDT',
+  'INJUSDT', 'ALGOUSDT', 'LTCUSDT', 'ADAUSDT', 'VETUSDT', 'AAVEUSDT', 'UNIUSDT',
+  // Tier-2: Neu validierte 7 Coins (4h Walk-Forward OOS +16R/18T)
+  'OPUSDT', 'FTMUSDT', 'GALAUSDT', 'MANAUSDT', 'ATOMUSDT', 'LDOUSDT', 'SNXUSDT',
 ];
 
 // ─── Tracking ────────────────────────────────────────────────────────────────

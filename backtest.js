@@ -3,23 +3,25 @@ const { EMA, ATR, ADX } = require('technicalindicators');
 
 // ── Config ─────────────────────────────────────────────────────────────────────
 const COINS = [
-  // Tier 1 — validiert, >6 Trades, positiv über 500 Tage
-  'UNIUSDT', 'XRPUSDT', 'ETHUSDT', 'SOLUSDT', 'LINKUSDT',
-  'INJUSDT', 'ALGOUSDT', 'LTCUSDT', 'ADAUSDT', 'VETUSDT', 'AAVEUSDT',
-  // Aktuelle Channel-Coins
-  'BNBUSDT',
+  // OOS-positive aus Batch 1 (≥0R OOS)
+  'OPUSDT', 'FTMUSDT', 'GALAUSDT', 'MANAUSDT', 'ATOMUSDT',
+  'MATICUSDT', 'LDOUSDT', 'SNXUSDT', 'AVAXUSDT',
 ];
 const SL_ATR_MULT   = 1.5;
 const MAX_SL_PCT    = 0.08;
 const TP1_R         = 2.0;
 const TP2_R         = 4.0;
-const LOOKBACK      = 210;
 const ADX_PERIOD    = 14;
 
-// ── Filter params (tune these) ───────────────────────────────────────────────
-const VOL_THRESHOLD   = 1.0;   // v6=1.0 baseline
-const COOLDOWN        = 6;     // v6=6 baseline
-const SLOPE_CANDLES   = 0;     // v6=0 baseline (disabled)
+// ── Timeframe config ─────────────────────────────────────────────────────────
+const INTERVAL      = '4h';    // '4h' oder '1h'
+const LOOKBACK      = INTERVAL === '1h' ? 840 : 210;   // EMA200 warmup
+const CANDLE_LIMIT  = INTERVAL === '1h' ? 5000 : 3000; // ~208 Tage auf 1h
+
+// ── Filter params ─────────────────────────────────────────────────────────────
+const VOL_THRESHOLD   = 1.0;
+const COOLDOWN        = INTERVAL === '1h' ? 24 : 6;    // 24h Cooldown
+const SLOPE_CANDLES   = 0;
 
 async function fetchCandles(symbol, interval = '4h', totalLimit = 3000) {
   const maxPerReq = 1000;
@@ -152,6 +154,25 @@ function analyze(candles, btcDirection) {
   }
 }
 
+function get4hTrend(candles4h, openTime) {
+  if (!candles4h) return null;
+  // Find the 4h candle that covers this 1h candle's openTime
+  let best = null;
+  for (let i = 0; i < candles4h.length; i++) {
+    if (candles4h[i].openTime <= openTime) best = i;
+    else break;
+  }
+  if (best === null || best < 50) return null;
+  const slice  = candles4h.slice(0, best + 1);
+  const closes = slice.map(c => c.close);
+  const ema20s = calcEMASeries(closes, 20);
+  const ema50s = calcEMASeries(closes, 50);
+  if (ema20s.length < 1 || ema50s.length < 1) return null;
+  const ema20 = ema20s[ema20s.length - 1];
+  const ema50 = ema50s[ema50s.length - 1];
+  return ema20 > ema50 ? 'bullish' : 'bearish';
+}
+
 function getBtcDirection(btcCandles, idx) {
   if (!btcCandles || idx < LOOKBACK) return null;
   const closes = btcCandles.slice(0, idx + 1).map(c => c.close);
@@ -163,8 +184,13 @@ function getBtcDirection(btcCandles, idx) {
 }
 
 async function backtestCoin(symbol, btcCandles) {
-  let candles;
-  try { candles = await fetchCandles(symbol); }
+  let candles, candles4h;
+  try {
+    [candles, candles4h] = await Promise.all([
+      fetchCandles(symbol, INTERVAL, CANDLE_LIMIT),
+      INTERVAL === '1h' ? fetchCandles(symbol, '4h', 1500) : Promise.resolve(null),
+    ]);
+  }
   catch (e) { return { symbol, error: e.message, trades: [] }; }
 
   const closes     = candles.map(c => c.close);
@@ -243,9 +269,15 @@ async function backtestCoin(symbol, btcCandles) {
 
     if (i - lastSignalIdx < COOLDOWN) continue;
 
-    const btcDir = isBtc ? null : getBtcDirection(btcCandles, i);
-    const sig    = analyze(candles.slice(0, i + 1), btcDir);
+    const btcDir  = isBtc ? null : getBtcDirection(btcCandles, i);
+    const sig     = analyze(candles.slice(0, i + 1), btcDir);
     if (!sig) continue;
+
+    // 4h trend alignment filter (1h only)
+    if (INTERVAL === '1h' && candles4h) {
+      const trend4h = get4hTrend(candles4h, c.openTime);
+      if (trend4h !== null && trend4h !== sig.direction) continue;
+    }
 
     lastSignalIdx = i;
     activeTrade   = { ...sig, tp1Hit: false };
@@ -255,14 +287,14 @@ async function backtestCoin(symbol, btcCandles) {
 }
 
 async function main() {
-  console.log('MarketLens Backtest — Tier-1 Coins Walk-Forward (12 Coins, 3000 Kerzen, ~500 Tage)');
-  console.log(`Filters:  EMA200 macro | BTC master | Vol ${VOL_THRESHOLD}x | ADX rising | Slope ${SLOPE_CANDLES}c | Cooldown ${COOLDOWN}*4h`);
+  console.log(`MarketLens Backtest — Walk-Forward ${INTERVAL.toUpperCase()} (20 neue Coins, ${CANDLE_LIMIT} Kerzen)`);
+  console.log(`Filters:  EMA200 macro | BTC master | Vol ${VOL_THRESHOLD}x | ADX rising | Cooldown ${COOLDOWN}*${INTERVAL}${INTERVAL==='1h' ? ' | 4h trend align' : ''}`);
   console.log('Exits:    TP1=2R (half out, SL→BE) → TP2=4R (full close) = +3R total\n');
 
   let btcCandles = null;
   try {
     process.stdout.write('Fetching BTC candles for master filter... ');
-    btcCandles = await fetchCandles('BTCUSDT');
+    btcCandles = await fetchCandles('BTCUSDT', INTERVAL, CANDLE_LIMIT);
     console.log('OK\n');
   } catch (e) {
     console.log(`FEHLER: ${e.message}\n`);
@@ -285,10 +317,13 @@ async function main() {
     const wins   = tp2s;
     const wr     = t.length > 0 ? Math.round(wins / t.length * 100) : 0;
     const maxR   = t.length > 0 ? Math.max(...t.map(x => x.r)).toFixed(1) : '–';
+    const oosT   = t.filter(x => x.period === 'out');
+    const oosR   = oosT.reduce((s, x) => s + x.r, 0);
+    const oosTag = oosT.length > 0 ? ` [OOS:${oosR >= 0 ? '+' : ''}${oosR.toFixed(0)}R/${oosT.length}T]` : '';
     console.log(
       `${String(t.length).padStart(3)}T (L:${longs}/S:${shorts}) | ` +
       `${tp2s}TP2 ${trails}Trail ${bes}BE ${losses}SL | ` +
-      `${totalR >= 0 ? '+' : ''}${totalR.toFixed(1)}R | WR:${wr}% | max:${maxR}R`
+      `${totalR >= 0 ? '+' : ''}${totalR.toFixed(1)}R | WR:${wr}%${oosTag}`
     );
     coinResults.push({ symbol: coin, trades: t.length, wins, tp2s, trails, bes, losses, totalR, wr });
     allTrades.push(...t);
@@ -315,7 +350,7 @@ async function main() {
   const tR        = allTrades.reduce((s, x) => s + x.r, 0);
 
   console.log('\n' + sep);
-  console.log('  WALK-FORWARD VALIDATION');
+  console.log(`  WALK-FORWARD VALIDATION — ${INTERVAL.toUpperCase()}`);
   console.log(sep);
   periodStats(inTrades,  '📊 IN-SAMPLE   (erste 60% / ~300 Tage)');
   console.log('');
