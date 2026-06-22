@@ -38,7 +38,8 @@ const INTERVAL_MS = (parseInt(process.env.WORKER_INTERVAL_MINUTES ?? '5', 10)) *
 // ─── Channel config ───────────────────────────────────────────────────────────
 const CHANNEL_ID: string | null = process.env.CHANNEL_ID ?? null;
 // Best performing coins from backtest analysis (EMA cross strategy)
-const CHANNEL_SYMBOLS = ['XRPUSDT', 'LTCUSDT', 'ATOMUSDT', 'BTCUSDT', 'BNBUSDT'];
+// Coins monitored in channel (BTC serves as both signal + master-filter anchor)
+const CHANNEL_SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'XRPUSDT', 'LTCUSDT', 'BNBUSDT', 'ATOMUSDT', 'SOLUSDT'];
 
 // ─── Daily recap tracking ────────────────────────────────────────────────────
 let lastRecapDate = '';
@@ -327,6 +328,19 @@ async function runAnalysis(): Promise<void> {
     return;
   }
 
+  // ── BTC Master Filter ─────────────────────────────────────────────────────
+  // Fetch BTC direction once per tick. Used to gate altcoin signals:
+  //   LONG  altcoin → only when BTC is NOT bearish (neutral or bullish)
+  //   SHORT altcoin → only when BTC is NOT bullish (neutral or bearish)
+  let btcDirection: 'bullish' | 'bearish' | null = null;
+  try {
+    const btcCandles4h = await getCandles('BTCUSDT', '4h', 100);
+    btcDirection = analyzeCandles('BTCUSDT', btcCandles4h).direction;
+    console.log(`[worker] BTC Master Filter: ${btcDirection ?? 'neutral'}`);
+  } catch (e) {
+    console.warn('[worker] Could not fetch BTC for master filter, proceeding unfiltered:', (e as Error).message);
+  }
+
   for (const [symbol, user_ids] of symbolMap) {
     try {
       const [candles4h, candles1h] = await Promise.all([
@@ -354,7 +368,22 @@ async function runAnalysis(): Promise<void> {
         continue;
       }
 
+      // 3. BTC Master Filter (skip for BTC itself)
+      if (symbol !== 'BTCUSDT' && btcDirection !== null) {
+        if (result4h.direction === 'bullish' && btcDirection === 'bearish') {
+          console.log(`[worker] ${symbol} LONG blocked — BTC Master Filter (BTC bearish)`);
+          continue;
+        }
+        if (result4h.direction === 'bearish' && btcDirection === 'bullish') {
+          console.log(`[worker] ${symbol} SHORT blocked — BTC Master Filter (BTC bullish)`);
+          continue;
+        }
+      }
+
       // Merge: use 4h trade levels, add 1h confirmation note to signals
+      const btcNote = symbol !== 'BTCUSDT' && btcDirection !== null
+        ? `, BTC ${btcDirection === 'bullish' ? 'bullisch' : 'baerisch'} ✅`
+        : '';
       const result: AnalysisResult = {
         ...result4h,
         signals: [
@@ -365,7 +394,7 @@ async function runAnalysis(): Promise<void> {
               s.includes('StochRSI') || s.includes('Divergenz') ||
               ['Hammer','Bullish Engulfing','Shooting Star','Bearish Engulfing','Morning Star','Bullish Marubozu','Bearish Marubozu','Doji'].some(p => s.includes(p))
             ).length
-          } Indikatoren) ✅`,
+          } Indikatoren${btcNote}) ✅`,
         ],
       };
 
