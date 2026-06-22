@@ -134,7 +134,7 @@ async function backtestCoin(symbol, btcCandles) {
 
       if (direction === 'bullish') {
         if (c.high >= tp2) {
-          trades.push({ symbol, direction, result: 'tp2', r: 4.0, entry });
+          trades.push({ symbol, direction, result: 'tp2', r: 3.0, entry });
           activeTrade = null; continue;
         }
         if (!activeTrade.tp1Hit && c.high >= tp1) {
@@ -143,14 +143,14 @@ async function backtestCoin(symbol, btcCandles) {
           continue;
         }
         if (c.low <= activeTrade.sl) {
-          // BE: TP1 was hit, SL now at entry → +0.75R (avg of +1.5R half + 0R half)
-          const r = activeTrade.tp1Hit ? 0.75 : -1;
+          // BE: half out at TP1 (+2R×0.5=+1R) + half at entry (0R) = +1R total
+          const r = activeTrade.tp1Hit ? 1.0 : -1;
           trades.push({ symbol, direction, result: activeTrade.tp1Hit ? 'be' : 'sl', r, entry });
           activeTrade = null; continue;
         }
       } else {
         if (c.low <= tp2) {
-          trades.push({ symbol, direction, result: 'tp2', r: 4.0, entry });
+          trades.push({ symbol, direction, result: 'tp2', r: 3.0, entry });
           activeTrade = null; continue;
         }
         if (!activeTrade.tp1Hit && c.low <= tp1) {

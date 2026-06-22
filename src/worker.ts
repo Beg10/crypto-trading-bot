@@ -274,8 +274,8 @@ async function checkActiveTrade(
     }
     if (low <= sl) {
       const reason = trade.tp1Hit ? 'be' : 'sl';
-      // TP1 hit = +1.5R on half, BE on rest -> avg +0.75R per trade unit
-      const resultR = trade.tp1Hit ? 0.75 : -1;
+      // BE: half out at TP1 (+2R×0.5=+1R) + half at entry (0R) = +1R total
+      const resultR = trade.tp1Hit ? 1.0 : -1;
       console.log(`[worker] ${symbol} SL hit${trade.tp1Hit ? ' (break-even)' : ''}`);
       await sendToTradeUsers(trade, buildExitMessage(trade, 'sl', close));
       const closeReason1 = trade.tp1Hit ? 'be' as const : 'sl' as const;
