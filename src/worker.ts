@@ -19,6 +19,8 @@ import {
   logSignal,
   closeSignal,
   markTp1Hit,
+  markTp2Hit,
+  markTp3Hit,
   getActiveSignals,
   getUsersInPosition,
   closeUserPositions,
@@ -578,6 +580,8 @@ async function runAnalysis(): Promise<void> {
             stop_loss:     result.stopLoss,
             take_profit1:  result.takeProfit1,
             take_profit2:  result.takeProfit2,
+            take_profit3:  result.direction === 'bullish' ? result.entry + Math.abs(result.entry - result.stopLoss) * 6 : result.entry - Math.abs(result.entry - result.stopLoss) * 6,
+            take_profit4:  result.direction === 'bullish' ? result.entry + Math.abs(result.entry - result.stopLoss) * 8 : result.entry - Math.abs(result.entry - result.stopLoss) * 8,
             risk_reward:   result.riskReward,
             signals:       result.signals,
             ema50:         result.ema50 ?? null,
@@ -703,7 +707,7 @@ async function checkMorningBriefing(): Promise<void> {
   }
 }
 
-// ─── Exit Monitor — TP1 / TP2 / SL / BE Checks ──────────────────────────────
+// ─── Exit Monitor — TP1 / TP2 / TP3 / TP4 / SL / BE Checks ─────────────────
 
 async function checkExits(): Promise<void> {
   let actives: import('./db').SignalLogEntry[];
@@ -715,70 +719,148 @@ async function checkExits(): Promise<void> {
     try {
       const candles = await getCandles(sig.symbol, '15m', 2);
       if (!candles || candles.length === 0) continue;
-      const latest   = candles[candles.length - 1];
-      const high      = latest.high;
-      const low       = latest.low;
-      const isLong    = sig.direction === 'bullish';
-      const tp1       = sig.take_profit1;
-      const tp2       = sig.take_profit2;
-      const sl        = sig.stop_loss;
-      const entry     = sig.entry;
-      const tp1HitAt  = sig.tp1_hit_at;
+      const latest  = candles[candles.length - 1];
+      const high    = latest.high;
+      const low     = latest.low;
+      const isLong  = sig.direction === 'bullish';
+      const coin    = sig.symbol.replace('USDT', '');
+      const dir     = isLong ? '🟢 LONG' : '🔴 SHORT';
+      const tp1     = sig.take_profit1;
+      const tp2     = sig.take_profit2;
+      const tp3     = sig.take_profit3;
+      const tp4     = sig.take_profit4;
+      const sl      = sig.stop_loss;
+      const entry   = sig.entry;
 
-      // ── TP2 check ────────────────────────────────────────────────────────
-      if ((isLong && high >= tp2) || (!isLong && low <= tp2)) {
-        await closeSignal(sig.id, 'tp2', tp2, 3.0);
-        const coin = sig.symbol.replace('USDT', '');
-        const dir  = isLong ? '🟢 LONG' : '🔴 SHORT';
+      const fmt = (n: number) => n.toFixed(4).replace(/\.?0+$/, '');
+
+      // ── TP4 check ────────────────────────────────────────────────────────
+      if (tp4 && !sig.tp3_hit_at && ((isLong && high >= tp4) || (!isLong && low <= tp4))) {
+        await closeSignal(sig.id, 'tp2', tp4, 6.0);
         const msg =
-          `🏆 *TP2 erreicht — ${coin}* ${dir}\n\n` +
-          `✅ *Alles rausnehmen!* Position vollständig schließen.\n\n` +
-          `💰 Ergebnis: *+3R Gesamt*\n` +
-          `   (½ bei TP1 +2R + ½ bei TP2 +4R = Ø +3R)\n\n` +
-          `Entry: ${entry} → TP2: ${tp2}`;
+          `🌕 *TP4 Moon Shot — ${coin}* ${dir}
+
+` +
+          `✅ *Alles rausnehmen!* Maximales Ziel erreicht!
+
+` +
+          `💰 Ergebnis: *+6R Gesamt*
+` +
+          `   (¼ TP1 + ¼ TP2 + ¼ TP3 + ¼ TP4)
+
+` +
+          `🎯 ${entry} → 🌕 ${fmt(tp4)}`;
         await sendToChannel(msg);
         continue;
       }
 
-      // ── TP1 check (nur wenn noch nicht getroffen) ────────────────────────
-      if (!tp1HitAt && ((isLong && high >= tp1) || (!isLong && low <= tp1))) {
-        await markTp1Hit(sig.id);
-        const coin = sig.symbol.replace('USDT', '');
-        const dir  = isLong ? '🟢 LONG' : '🔴 SHORT';
+      // ── TP3 check ────────────────────────────────────────────────────────
+      if (tp3 && !sig.tp3_hit_at && sig.tp2_hit_at && ((isLong && high >= tp3) || (!isLong && low <= tp3))) {
+        await markTp3Hit(sig.id);
         const msg =
-          `🎯 *TP1 erreicht — ${coin}* ${dir}\n\n` +
-          `💡 *Empfehlung:* Hälfte der Position schließen (+2R gesichert).\n` +
-          `   Stop Loss auf *Break-Even (${entry})* verschieben.\n\n` +
-          `🎯 Nächstes Ziel: TP2 @ *${tp2}* (+4R)\n` +
-          `📊 Rest läuft risikofrei weiter.`;
+          `🚀 *TP3 erreicht — ${coin}* ${dir}
+
+` +
+          `💡 *Empfehlung:* Weiteres ¼ schließen.
+` +
+          `   Letztes ¼ läuft Richtung *TP4 @ ${tp4 ? fmt(tp4) : '?'}*
+
+` +
+          `💰 Bisher gesichert: *+4.5R*
+` +
+          `🌕 TP4 = Moon Shot (+8R)`;
+        await sendToChannel(msg);
+        continue;
+      }
+
+      // ── TP2 check ────────────────────────────────────────────────────────
+      if (!sig.tp2_hit_at && sig.tp1_hit_at && ((isLong && high >= tp2) || (!isLong && low <= tp2))) {
+        if (tp3) {
+          // Noch TP3/TP4 offen → nur Notification, nicht schließen
+          await markTp2Hit(sig.id);
+          const msg =
+            `🎯 *TP2 erreicht — ${coin}* ${dir}
+
+` +
+            `💡 *Empfehlung:* Weiteres ¼ schließen (+4R gesichert).
+` +
+            `   Rest läuft Richtung *TP3 @ ${fmt(tp3)}*
+
+` +
+            `💰 Bisher gesichert: *+3R*
+` +
+            `🚀 TP3 = +6R · 🌕 TP4 = +8R`;
+          await sendToChannel(msg);
+        } else {
+          // Kein TP3/TP4 → Vollständig schließen
+          await closeSignal(sig.id, 'tp2', tp2, 3.0);
+          const msg =
+            `🏆 *TP2 erreicht — ${coin}* ${dir}
+
+` +
+            `✅ *Alles rausnehmen!* Position vollständig schließen.
+
+` +
+            `💰 Ergebnis: *+3R Gesamt*
+` +
+            `   (½ bei TP1 + ½ bei TP2)
+
+` +
+            `Entry: ${fmt(entry)} → TP2: ${fmt(tp2)}`;
+          await sendToChannel(msg);
+        }
+        continue;
+      }
+
+      // ── TP1 check ────────────────────────────────────────────────────────
+      if (!sig.tp1_hit_at && ((isLong && high >= tp1) || (!isLong && low <= tp1))) {
+        await markTp1Hit(sig.id);
+        const msg =
+          `🎯 *TP1 erreicht — ${coin}* ${dir}
+
+` +
+          `💡 *Empfehlung:* 25% der Position schließen (+2R gesichert).
+` +
+          `   Stop Loss auf *Break-Even (${fmt(entry)})* verschieben.
+
+` +
+          `🎯 TP2 @ *${fmt(tp2)}* (+4R)
+` +
+          `🚀 TP3 @ *${tp3 ? fmt(tp3) : '?'}* (+6R)
+` +
+          `🌕 TP4 @ *${tp4 ? fmt(tp4) : '?'}* (+8R)`;
         await sendToChannel(msg);
         continue;
       }
 
       // ── SL / BE check ────────────────────────────────────────────────────
-      const effectiveSl = tp1HitAt ? entry : sl; // nach TP1 → SL auf Entry
+      const effectiveSl = sig.tp1_hit_at ? entry : sl;
       if ((isLong && low <= effectiveSl) || (!isLong && high >= effectiveSl)) {
-        if (tp1HitAt) {
-          // Break-Even: TP1 war schon getroffen, SL war auf Entry
+        if (sig.tp1_hit_at) {
           await closeSignal(sig.id, 'be', effectiveSl, 1.0);
-          const coin = sig.symbol.replace('USDT', '');
-          const dir  = isLong ? '🟢 LONG' : '🔴 SHORT';
           const msg =
-            `⚪ *Break-Even — ${coin}* ${dir}\n\n` +
-            `SL wurde nach TP1 auf Entry gesetzt — kein Verlust.\n` +
-            `💰 Ergebnis: *+1R* (TP1 Hälfte gesichert)\n\n` +
+            `⚪ *Break-Even — ${coin}* ${dir}
+
+` +
+            `SL war auf Entry — kein Verlust am Rest.
+` +
+            `💰 Ergebnis: *+1R* (TP1 gesichert)
+
+` +
             `Nächste Chance kommt. 📈`;
           await sendToChannel(msg);
         } else {
-          // Normaler SL
           await closeSignal(sig.id, 'sl', effectiveSl, -1.0);
-          const coin = sig.symbol.replace('USDT', '');
-          const dir  = isLong ? '🟢 LONG' : '🔴 SHORT';
           const msg =
-            `🛑 *Stop Loss — ${coin}* ${dir}\n\n` +
-            `Position wurde gestoppt.\n` +
-            `💸 Ergebnis: *-1R*\n\n` +
-            `Kein Problem — Verluste gehören dazu. Nächstes Signal kommt. 💪`;
+            `🛑 *Stop Loss — ${coin}* ${dir}
+
+` +
+            `Position gestoppt.
+` +
+            `💸 Ergebnis: *-1R*
+
+` +
+            `Verluste gehören dazu — nächstes Signal kommt. 💪`;
           await sendToChannel(msg);
         }
       }

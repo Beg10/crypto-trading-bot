@@ -179,6 +179,8 @@ export interface SignalLogEntry {
   close_price: number | null;
   result_r: number | null;
   tp1_hit_at: string | null;
+  tp2_hit_at: string | null;
+  tp3_hit_at: string | null;
 }
 
 export async function logSignal(data: {
@@ -188,6 +190,8 @@ export async function logSignal(data: {
   stop_loss: number;
   take_profit1: number;
   take_profit2: number;
+  take_profit3?: number | null;
+  take_profit4?: number | null;
   risk_reward: number | null;
   signals: string[];
   ema50: number | null;
@@ -226,6 +230,22 @@ export async function markTp1Hit(id: string): Promise<void> {
     .update({ tp1_hit_at: new Date().toISOString() })
     .eq('id', id);
   if (error) throw new Error(`DB markTp1Hit: ${error.message}`);
+}
+
+export async function markTp2Hit(id: string): Promise<void> {
+  const { error } = await supabase
+    .from('signal_log')
+    .update({ tp2_hit_at: new Date().toISOString() })
+    .eq('id', id);
+  if (error) throw new Error(`DB markTp2Hit: ${error.message}`);
+}
+
+export async function markTp3Hit(id: string): Promise<void> {
+  const { error } = await supabase
+    .from('signal_log')
+    .update({ tp3_hit_at: new Date().toISOString() })
+    .eq('id', id);
+  if (error) throw new Error(`DB markTp3Hit: ${error.message}`);
 }
 
 export async function getActiveSignals(): Promise<SignalLogEntry[]> {
