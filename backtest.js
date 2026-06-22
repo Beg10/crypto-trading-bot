@@ -1,19 +1,25 @@
 const axios = require('axios');
-const { EMA, ATR, ADX, RSI } = require('technicalindicators');
+const { EMA, ATR, ADX } = require('technicalindicators');
 
 // ── Config ─────────────────────────────────────────────────────────────────────
-const COINS         = ['BTCUSDT', 'ETHUSDT', 'XRPUSDT', 'LTCUSDT', 'BNBUSDT', 'ATOMUSDT', 'SOLUSDT', 'AVAXUSDT', 'LINKUSDT', 'DOTUSDT', 'ADAUSDT'];
-const VOL_THRESHOLD = 1.0;
+const COINS = [
+  // Tier 1 — validiert, >6 Trades, positiv über 500 Tage
+  'UNIUSDT', 'XRPUSDT', 'ETHUSDT', 'SOLUSDT', 'LINKUSDT',
+  'INJUSDT', 'ALGOUSDT', 'LTCUSDT', 'ADAUSDT', 'VETUSDT', 'AAVEUSDT',
+  // Aktuelle Channel-Coins
+  'BNBUSDT',
+];
 const SL_ATR_MULT   = 1.5;
 const MAX_SL_PCT    = 0.08;
 const TP1_R         = 2.0;
 const TP2_R         = 4.0;
-const COOLDOWN      = 6;
 const LOOKBACK      = 210;
 const ADX_PERIOD    = 14;
-const RSI_PERIOD    = 14;
-const RSI_LONG_MAX  = 65;   // don't enter LONG if RSI >= this (overbought)
-const RSI_SHORT_MIN = 35;   // don't enter SHORT if RSI <= this (oversold)
+
+// ── Filter params (tune these) ───────────────────────────────────────────────
+const VOL_THRESHOLD   = 1.0;   // v6=1.0 baseline
+const COOLDOWN        = 6;     // v6=6 baseline
+const SLOPE_CANDLES   = 0;     // v6=0 baseline (disabled)
 
 async function fetchCandles(symbol, interval = '4h', totalLimit = 3000) {
   const maxPerReq = 1000;
@@ -69,12 +75,6 @@ function calcVolumeRatio(candles, period = 20) {
   return avg > 0 ? candles[candles.length - 1].volume / avg : null;
 }
 
-function calcRSILast(closes, period = RSI_PERIOD) {
-  if (closes.length < period + 1) return null;
-  const vals = RSI.calculate({ values: closes, period });
-  return vals.length > 0 ? vals[vals.length - 1] : null;
-}
-
 function isAdxRisingAt(adxSeries, idx) {
   if (idx < 3 || adxSeries.length <= idx) return false;
   return adxSeries[idx].adx > adxSeries[idx - 3].adx;
@@ -96,6 +96,18 @@ function analyze(candles, btcDirection) {
   const ema50p = ema50s[ema50s.length - 2];
   const ema200 = ema200s[ema200s.length - 1];
 
+  // EMA Slope filter: EMA20 must have been rising/falling for SLOPE_CANDLES before cross
+  let slopeOkL = true, slopeOkS = true;
+  if (SLOPE_CANDLES > 0 && ema20s.length > SLOPE_CANDLES + 1) {
+    slopeOkL = true; slopeOkS = true;
+    for (let s = 1; s <= SLOPE_CANDLES; s++) {
+      const cur  = ema20s[ema20s.length - 1 - s];
+      const prev = ema20s[ema20s.length - 2 - s];
+      if (cur <= prev) slopeOkL = false; // must be rising for LONG
+      if (cur >= prev) slopeOkS = false; // must be falling for SHORT
+    }
+  }
+
   const volRatio = calcVolumeRatio(candles);
   const volOk    = volRatio === null || volRatio >= VOL_THRESHOLD;
 
@@ -110,13 +122,10 @@ function analyze(candles, btcDirection) {
   const macroUp     = price > ema200;
   const macroDown   = price < ema200;
 
-  const rsi    = calcRSILast(closes);
-  const rsiOkL = rsi === null || rsi < RSI_LONG_MAX;   // not overbought for longs
-  const rsiOkS = rsi === null || rsi > RSI_SHORT_MIN;  // not oversold for shorts
 
   let direction = null;
-  if (goldenCross && macroUp   && volOk && adxOk) direction = 'bullish';
-  if (deathCross  && macroDown && volOk && adxOk) direction = 'bearish';
+  if (goldenCross && macroUp   && volOk && adxOk && slopeOkL) direction = 'bullish';
+  if (deathCross  && macroDown && volOk && adxOk && slopeOkS) direction = 'bearish';
   if (!direction) return null;
 
   if (btcDirection !== null) {
@@ -246,8 +255,8 @@ async function backtestCoin(symbol, btcCandles) {
 }
 
 async function main() {
-  console.log('MarketLens Backtest — Walk-Forward Validation (3000 Kerzen / ~500 Tage)');
-  console.log('Filters:  EMA200 macro | BTC master | Volume 1.0x | ADX rising');
+  console.log('MarketLens Backtest — Tier-1 Coins Walk-Forward (12 Coins, 3000 Kerzen, ~500 Tage)');
+  console.log(`Filters:  EMA200 macro | BTC master | Vol ${VOL_THRESHOLD}x | ADX rising | Slope ${SLOPE_CANDLES}c | Cooldown ${COOLDOWN}*4h`);
   console.log('Exits:    TP1=2R (half out, SL→BE) → TP2=4R (full close) = +3R total\n');
 
   let btcCandles = null;

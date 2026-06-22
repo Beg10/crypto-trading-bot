@@ -41,7 +41,12 @@ const INTERVAL_MS = (parseInt(process.env.WORKER_INTERVAL_MINUTES ?? '5', 10)) *
 
 // ─── Channel config ───────────────────────────────────────────────────────────
 const CHANNEL_ID: string | null = process.env.CHANNEL_ID ?? null;
-const CHANNEL_SYMBOLS = ['ETHUSDT', 'XRPUSDT', 'LTCUSDT', 'BNBUSDT', 'SOLUSDT', 'LINKUSDT'];
+const CHANNEL_SYMBOLS = [
+  // Tier-1 validiert (Walk-Forward positiv, 500 Tage, >6 Trades)
+  'UNIUSDT', 'XRPUSDT', 'ETHUSDT', 'SOLUSDT', 'LINKUSDT',
+  'INJUSDT', 'ALGOUSDT', 'LTCUSDT', 'ADAUSDT', 'VETUSDT', 'AAVEUSDT',
+  'BNBUSDT',
+];
 
 // ─── Tracking ────────────────────────────────────────────────────────────────
 let lastRecapDate    = '';
@@ -761,9 +766,10 @@ async function main(): Promise<void> {
 }
 
 process.on('uncaughtException', async (err) => {
-  await notifyAdmin('Worker crashed!\n' + err.message);
+  await notifyAdmin('Worker fatal error!\n' + (err as Error).message);
 });
 
 main().catch(async (e) => {
   await notifyAdmin('Worker fatal error!\n' + (e as Error).message);
 });
+
