@@ -201,7 +201,7 @@ export async function logSignal(data: {
 
 export async function closeSignal(
   id: string,
-  closeReason: 'sl' | 'tp1' | 'tp2',
+  closeReason: 'sl' | 'tp1' | 'tp2' | 'be',
   closePrice: number,
   resultR: number,
 ): Promise<void> {

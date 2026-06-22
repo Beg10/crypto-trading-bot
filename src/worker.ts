@@ -272,11 +272,13 @@ async function checkActiveTrade(
       return;
     }
     if (low <= sl) {
-      const reason = trade.tp1Hit ? 'tp1' : 'sl'; // tp1 already counted
-      const resultR = trade.tp1Hit ? 0 : -1;
+      const reason = trade.tp1Hit ? 'be' : 'sl';
+      // TP1 hit = +1.5R on half, BE on rest -> avg +0.75R per trade unit
+      const resultR = trade.tp1Hit ? 0.75 : -1;
       console.log(`[worker] ${symbol} SL hit${trade.tp1Hit ? ' (break-even)' : ''}`);
       await sendToTradeUsers(trade, buildExitMessage(trade, 'sl', close));
-      if (trade.signalLogId) await closeSignal(trade.signalLogId, 'sl', close, resultR).catch(console.error);
+      const closeReason1 = trade.tp1Hit ? 'be' as const : 'sl' as const;
+      if (trade.signalLogId) await closeSignal(trade.signalLogId, closeReason1, close, resultR).catch(console.error);
       activeTrades.delete(symbol);
       return;
     }
@@ -296,10 +298,12 @@ async function checkActiveTrade(
       return;
     }
     if (high >= sl) {
-      const resultR = trade.tp1Hit ? 0 : -1;
-      console.log(`[worker] ${symbol} SL hit${trade.tp1Hit ? ' (break-even)' : ''}`);
+      // TP1 hit = +1.5R on half, BE on rest -> avg +0.75R
+      const resultR = trade.tp1Hit ? 0.75 : -1;
+      const closeReason2 = trade.tp1Hit ? 'be' as const : 'sl' as const;
+      console.log(`[worker] ${symbol} SL hit${trade.tp1Hit ? ' (break-even +0.75R)' : ''}`);
       await sendToTradeUsers(trade, buildExitMessage(trade, 'sl', close));
-      if (trade.signalLogId) await closeSignal(trade.signalLogId, 'sl', close, resultR).catch(console.error);
+      if (trade.signalLogId) await closeSignal(trade.signalLogId, closeReason2, close, resultR).catch(console.error);
       activeTrades.delete(symbol);
       return;
     }

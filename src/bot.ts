@@ -12,6 +12,7 @@ import { handleStatus } from './commands/status';
 import { buildRecapMessage } from './commands/recap';
 import { buildWeeklyReportMessage } from './commands/weeklyReport';
 import { buildStatsMessage } from './commands/stats';
+import { buildAktivMessage } from './commands/aktiv';
 
 if (!process.env.BOT_TOKEN) {
   throw new Error('BOT_TOKEN environment variable is not set');
@@ -44,6 +45,10 @@ bot.command('status', handleStatus);
 bot.command('woche', async (ctx) => {
   await ctx.reply('Lade Wochen-Report...', { parse_mode: 'Markdown' });
   const msg = await buildWeeklyReportMessage();
+  await ctx.reply(msg, { parse_mode: 'Markdown' });
+});
+bot.command('aktiv', async (ctx) => {
+  const msg = await buildAktivMessage();
   await ctx.reply(msg, { parse_mode: 'Markdown' });
 });
 bot.command('stats', async (ctx) => {
