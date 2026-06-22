@@ -101,8 +101,8 @@ export function analyzeCandles(symbol: string, candles: Candle[]): AnalysisResul
   const ema50p = ema50Series.length  > 1 ? ema50Series[ema50Series.length - 2]   : null;
   const ema200 = ema200Series.length > 0 ? ema200Series[ema200Series.length - 1] : null;
 
-  // Volume must be at least average
-  const volumeOk = volumeRatio === null || volumeRatio >= 1.0;
+  // Volume must be at least 20% above average to confirm breakout
+  const volumeOk = volumeRatio === null || volumeRatio >= 1.2;
 
   // EMA20/50 cross detection
   const goldenCross = ema20p !== null && ema50p !== null && ema20 !== null && ema50 !== null &&
@@ -110,13 +110,20 @@ export function analyzeCandles(symbol: string, candles: Candle[]): AnalysisResul
   const deathCross  = ema20p !== null && ema50p !== null && ema20 !== null && ema50 !== null &&
     ema20p >= ema50p && ema20 < ema50;
 
+  // EMA spread filter: cross must have meaningful separation (>= 0.3% of price)
+  // Prevents signals on tiny micro-crosses in sideways markets
+  const emaSpread = (ema20 !== null && ema50 !== null && price > 0)
+    ? Math.abs(ema20 - ema50) / price
+    : 0;
+  const spreadOk = emaSpread >= 0.003; // 0.3% minimum separation
+
   // Macro trend filter: EMA200 must confirm
   const macroUptrend   = ema200 === null || price > ema200;
   const macroDowntrend = ema200 === null || price < ema200;
 
   let direction: 'bullish' | 'bearish' | null = null;
-  if (goldenCross && macroUptrend   && volumeOk) direction = 'bullish';
-  if (deathCross  && macroDowntrend && volumeOk) direction = 'bearish';
+  if (goldenCross && macroUptrend   && volumeOk && spreadOk) direction = 'bullish';
+  if (deathCross  && macroDowntrend && volumeOk && spreadOk) direction = 'bearish';
 
   // Build signal info lines
   const signals: string[] = [];
@@ -128,8 +135,9 @@ export function analyzeCandles(symbol: string, candles: Candle[]): AnalysisResul
   if (ema200 !== null) {
     signals.push(`EMA200: $${ema200.toFixed(2)} — Makrotrend ${price > ema200 ? '↗ bullisch' : '↘ baerisch'}`);
   }
+  signals.push(`EMA-Spread: ${(emaSpread * 100).toFixed(3)}% ${spreadOk ? '✅' : '⚠️ (zu eng)'}`);
   if (volumeRatio !== null) {
-    signals.push(`Volumen: ${volumeRatio.toFixed(2)}x Durchschnitt ${volumeRatio >= 1.0 ? '✅' : '⚠️'}`);
+    signals.push(`Volumen: ${volumeRatio.toFixed(2)}x Durchschnitt ${volumeRatio >= 1.2 ? '✅' : '⚠️'}`);
   }
 
   let entry:       number | null = null;
