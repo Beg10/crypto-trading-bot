@@ -46,6 +46,9 @@ const CHANNEL_SYMBOLS = ['ETHUSDT', 'XRPUSDT', 'LTCUSDT', 'BNBUSDT', 'ATOMUSDT',
 let lastRecapDate = '';
 let lastWeeklyDate = '';
 
+// ─── BTC Macro Shift tracking ─────────────────────────────────────────────────
+let lastBtcMacro: 'bullish' | 'bearish' | null = null;
+
 // ─── Signal deduplication ─────────────────────────────────────────────────────
 const lastAlertTime = new Map<string, number>();
 const ALERT_COOLDOWN_MS = 60 * 60 * 1000;
@@ -313,6 +316,56 @@ async function checkActiveTrade(
 
 // ─── Analysis tick ────────────────────────────────────────────────────────────
 
+// ─── BTC Macro Shift Alert ───────────────────────────────────────────────────
+// Fires once when BTC crosses its EMA200 — signals a market regime change
+
+async function checkBtcMacroShift(): Promise<void> {
+  try {
+    const candles = await getCandles('BTCUSDT', '4h', 250);
+    const closes  = candles.map((c) => c.close);
+    const price   = closes[closes.length - 1];
+
+    const { EMA } = await import('technicalindicators');
+    const ema200s = EMA.calculate({ values: closes, period: 200 });
+    if (ema200s.length === 0) return;
+    const ema200 = ema200s[ema200s.length - 1];
+
+    const current: 'bullish' | 'bearish' = price > ema200 ? 'bullish' : 'bearish';
+
+    if (lastBtcMacro !== null && current !== lastBtcMacro) {
+      // Regime changed — alert channel and admin
+      const isBull = current === 'bullish';
+      const msg =
+        `🌍 *BTC Makro-Shift — Marktregime geändert!*
+
+` +
+        `${isBull ? '🟢' : '🔴'} BTC ist jetzt *${isBull ? 'BULLISCH' : 'BÄRISCH'}* (EMA200)
+
+` +
+        `📍 *BTC Preis:* $${price.toLocaleString('en-US', { maximumFractionDigits: 0 })}
+` +
+        `📊 *EMA200:* $${ema200.toLocaleString('en-US', { maximumFractionDigits: 0 })}
+
+` +
+        `${isBull
+          ? '👉 Bot wechselt in _Long-Modus_ — Short-Signale auf Altcoins werden unterdrückt.'
+          : '👉 Bot wechselt in _Short-Modus_ — Long-Signale auf Altcoins werden unterdrückt.'
+        }
+
+` +
+        `_MarketLens Makro-Alert · ${new Date().toLocaleString('de-DE', { timeZone: 'Europe/Berlin' })} Berlin_`;
+
+      await sendToChannel(msg);
+      await notifyAdmin(msg);
+      console.log(`[worker] BTC macro shift: ${lastBtcMacro} → ${current}`);
+    }
+
+    lastBtcMacro = current;
+  } catch (e) {
+    console.error('[worker] BTC macro check failed:', (e as Error).message);
+  }
+}
+
 async function runAnalysis(): Promise<void> {
   console.log('[worker] Running analysis tick…');
 
@@ -537,6 +590,7 @@ async function checkDailyRecap(): Promise<void> {
 async function tick(): Promise<void> {
   await Promise.allSettled([runAnalysis(), runNewsPipeline()]);
   await checkDailyRecap();
+  await checkBtcMacroShift();
 }
 
 // ─── Admin notification ───────────────────────────────────────────────────────
