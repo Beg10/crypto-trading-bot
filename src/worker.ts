@@ -18,6 +18,7 @@ import {
   upsertNewsItems,
   logSignal,
   closeSignal,
+  getActiveSignals,
 } from './db';
 import { getCandles } from './services/binance';
 import { analyzeCandles, isNotifiableSignal } from './services/analysis';
@@ -550,11 +551,46 @@ async function notifyAdmin(message: string): Promise<void> {
   }
 }
 
+// ─── Restore active trades after restart ──────────────────────────────────────
+
+async function restoreActiveTrades(): Promise<void> {
+  try {
+    const openSignals = await getActiveSignals();
+    if (openSignals.length === 0) return;
+
+    for (const sig of openSignals) {
+      if (activeTrades.has(sig.symbol)) continue; // already tracked
+
+      activeTrades.set(sig.symbol, {
+        symbol:        sig.symbol,
+        direction:     sig.direction as 'bullish' | 'bearish',
+        entry:         sig.entry,
+        sl:            sig.stop_loss,
+        originalSl:    sig.stop_loss,
+        tp1:           sig.take_profit1,
+        tp2:           sig.take_profit2,
+        users:         [], // entry alerts already sent — no DMs on exit after restart
+        openTime:      new Date(sig.opened_at).getTime(),
+        tp1Hit:        false,
+        postToChannel: CHANNEL_ID !== null && CHANNEL_SYMBOLS.includes(sig.symbol),
+        signalLogId:   sig.id,
+      });
+
+      console.log(`[worker] Restored trade: ${sig.symbol} ${sig.direction} from ${sig.opened_at}`);
+    }
+
+    console.log(`[worker] Restored ${openSignals.length} active trade(s) from Supabase`);
+  } catch (e) {
+    console.error('[worker] Could not restore active trades:', (e as Error).message);
+  }
+}
+
 // ─── Entry point ──────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
   console.log(`[worker] Starting — interval: ${INTERVAL_MS / 60000} min`);
   if (CHANNEL_ID) console.log(`[worker] Channel broadcasting active: ${CHANNEL_ID}`);
+  await restoreActiveTrades();
   await notifyAdmin(`⚙️ *Worker gestartet!*\nAnalyse-Intervall: ${INTERVAL_MS / 60000} min\n_${new Date().toISOString()}_`);
   setInterval(tick, INTERVAL_MS);
   await tick();
