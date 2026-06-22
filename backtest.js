@@ -159,7 +159,7 @@ async function backtestCoin(symbol, btcCandles) {
           continue;
         }
         if (c.high >= activeTrade.sl) {
-          const r = activeTrade.tp1Hit ? 0.75 : -1;
+          const r = activeTrade.tp1Hit ? 1.0 : -1;
           trades.push({ symbol, direction, result: activeTrade.tp1Hit ? 'be' : 'sl', r, entry });
           activeTrade = null; continue;
         }
@@ -236,7 +236,7 @@ async function main() {
   console.log(sep);
   console.log(`Trades:        ${tT} (Long:${allTrades.filter(x => x.direction === 'bullish').length} / Short:${allTrades.filter(x => x.direction === 'bearish').length})`);
   console.log(`Gewonnen:      ${tW} (TP1:${tTP1} / TP2:${tTP2})`);
-  console.log(`Break-Even:    ${tBE} (TP1 war drin, +0.75R each)`);
+  console.log(`Break-Even:    ${tBE} (TP1 war drin, +1.0R each)`);
   console.log(`Verloren:      ${tL}`);
   console.log(`Trefferquote:  ${wr}%  (nur TP1/TP2 = Win)`);
   console.log(`Gesamt R:      ${tR >= 0 ? '+' : ''}${tR.toFixed(1)}R`);
@@ -260,3 +260,4 @@ async function main() {
 }
 
 main().catch(console.error);
+  
