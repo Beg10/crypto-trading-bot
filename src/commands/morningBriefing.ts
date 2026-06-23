@@ -7,7 +7,15 @@ import { Bot } from 'grammy';
 import { getCandles } from '../services/binance';
 import { EMA, ADX } from 'technicalindicators';
 
-const BRIEFING_COINS = ['BTCUSDT', 'ETHUSDT', 'XRPUSDT', 'LTCUSDT', 'BNBUSDT', 'SOLUSDT', 'LINKUSDT', 'UNIUSDT', 'INJUSDT', 'ALGOUSDT', 'ADAUSDT', 'VETUSDT', 'AAVEUSDT'];
+const BRIEFING_COINS = [
+  // BTC als Macro-Referenz
+  'BTCUSDT',
+  // Tier-1 (12 validierte Coins)
+  'ETHUSDT', 'BNBUSDT', 'XRPUSDT', 'SOLUSDT', 'LINKUSDT',
+  'INJUSDT', 'ALGOUSDT', 'LTCUSDT', 'ADAUSDT', 'VETUSDT', 'AAVEUSDT', 'UNIUSDT',
+  // Tier-2 (7 neue validierte Coins)
+  'OPUSDT', 'FTMUSDT', 'GALAUSDT', 'MANAUSDT', 'ATOMUSDT', 'LDOUSDT', 'SNXUSDT',
+];
 
 interface CoinStatus {
   symbol:     string;
