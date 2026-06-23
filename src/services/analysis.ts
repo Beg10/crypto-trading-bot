@@ -301,12 +301,11 @@ export function analyzeRsiBounce(symbol: string, candles: Candle[]): AnalysisRes
 
   let direction: 'bullish' | 'bearish' | null = null;
 
+  // RSI Bounce = pure mean reversion — kein EMA200 Filter nötig
+  // (EMA200 würde in Korrekturen alle LONG Signale blockieren)
   if (rsiValue !== null) {
-    const macroUp   = ema200 === null || price > ema200;
-    const macroDown = ema200 === null || price < ema200;
-
-    if (rsiValue < 30 && macroUp)   direction = 'bullish';
-    if (rsiValue > 70 && macroDown) direction = 'bearish';
+    if (rsiValue < 30) direction = 'bullish';
+    if (rsiValue > 70) direction = 'bearish';
   }
 
   const signals: string[] = [];
