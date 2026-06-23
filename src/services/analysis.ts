@@ -326,16 +326,14 @@ export function analyzeRsiBounce(symbol: string, candles: Candle[]): AnalysisRes
   let riskReward:  number | null = null;
 
   if (direction !== null) {
-    const levels = calcTradeLevels(candles, direction);
-    if (levels) {
-      entry       = levels.entry;
-      stopLoss    = levels.stopLoss;
-      takeProfit1 = levels.takeProfit1;
-      takeProfit2 = levels.takeProfit2;
-      riskReward  = levels.riskReward;
-    } else {
-      direction = null;
-    }
+    // RSI Bounce: einfacher ATR-basierter SL (kein 8% Cap, kein SwingLow)
+    const atr = calcATR(candles) ?? price * 0.02;
+    const risk = atr * 2;
+    entry       = price;
+    stopLoss    = direction === 'bullish' ? price - risk : price + risk;
+    takeProfit1 = direction === 'bullish' ? price + risk * 2 : price - risk * 2;
+    takeProfit2 = direction === 'bullish' ? price + risk * 4 : price - risk * 4;
+    riskReward  = 2.0;
   }
 
   return {
