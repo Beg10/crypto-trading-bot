@@ -50,6 +50,8 @@ const CHANNEL_SYMBOLS = [
   'INJUSDT', 'ALGOUSDT', 'LTCUSDT', 'ADAUSDT', 'VETUSDT', 'AAVEUSDT', 'UNIUSDT',
   // Tier-2: Neu validierte 7 Coins (4h Walk-Forward OOS +16R/18T)
   'OPUSDT', 'FTMUSDT', 'GALAUSDT', 'MANAUSDT', 'ATOMUSDT', 'LDOUSDT', 'SNXUSDT',
+  // Tier-3: Batch 3 validierte 5 Coins (4h Walk-Forward OOS +4R)
+  'JUPUSDT', 'PYTHUSDT', 'WLDUSDT', 'NOTUSDT', 'WIFUSDT',
 ];
 
 // ─── Tracking ────────────────────────────────────────────────────────────────

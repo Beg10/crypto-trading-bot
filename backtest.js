@@ -3,9 +3,11 @@ const { EMA, ATR, ADX } = require('technicalindicators');
 
 // ── Config ─────────────────────────────────────────────────────────────────────
 const COINS = [
-  // OOS-positive aus Batch 1 (≥0R OOS)
-  'OPUSDT', 'FTMUSDT', 'GALAUSDT', 'MANAUSDT', 'ATOMUSDT',
-  'MATICUSDT', 'LDOUSDT', 'SNXUSDT', 'AVAXUSDT',
+  // Batch 3 — neue ungetestete Coins
+  'PEPEUSDT', 'WIFUSDT', 'JUPUSDT', 'TIAUSDT', 'SEIUSDT',
+  'PYTHUSDT', 'STRKUSDT', 'WLDUSDT', 'FETUSDT', 'RENDERUSDT',
+  'INJUSDT', 'TAOUSDT', 'ONDOUSDT', 'ENAUSDT', 'EIGENUSDT',
+  'POLUSDT', 'NOTUSDT', 'HMSTRUSDT', 'REZUSDT', 'BBUSDT',
 ];
 const SL_ATR_MULT   = 1.5;
 const MAX_SL_PCT    = 0.08;
@@ -16,7 +18,7 @@ const ADX_PERIOD    = 14;
 // ── Timeframe config ─────────────────────────────────────────────────────────
 const INTERVAL      = '4h';    // '4h' oder '1h'
 const LOOKBACK      = INTERVAL === '1h' ? 840 : 210;   // EMA200 warmup
-const CANDLE_LIMIT  = INTERVAL === '1h' ? 5000 : 3000; // ~208 Tage auf 1h
+const CANDLE_LIMIT  = INTERVAL === '1h' ? 5000 : 3000; // ~500 Tage auf 4h // ~208 Tage auf 1h
 
 // ── Filter params ─────────────────────────────────────────────────────────────
 const VOL_THRESHOLD   = 1.0;
@@ -287,7 +289,7 @@ async function backtestCoin(symbol, btcCandles) {
 }
 
 async function main() {
-  console.log(`MarketLens Backtest — Walk-Forward ${INTERVAL.toUpperCase()} (20 neue Coins, ${CANDLE_LIMIT} Kerzen)`);
+  console.log(`MarketLens Backtest — Walk-Forward ${INTERVAL.toUpperCase()} (Batch 3 / 20 Coins, ${CANDLE_LIMIT} Kerzen)`);
   console.log(`Filters:  EMA200 macro | BTC master | Vol ${VOL_THRESHOLD}x | ADX rising | Cooldown ${COOLDOWN}*${INTERVAL}${INTERVAL==='1h' ? ' | 4h trend align' : ''}`);
   console.log('Exits:    TP1=2R (half out, SL→BE) → TP2=4R (full close) = +3R total\n');
 

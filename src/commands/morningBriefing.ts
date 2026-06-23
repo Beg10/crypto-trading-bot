@@ -13,8 +13,10 @@ const BRIEFING_COINS = [
   // Tier-1 (12 validierte Coins)
   'ETHUSDT', 'BNBUSDT', 'XRPUSDT', 'SOLUSDT', 'LINKUSDT',
   'INJUSDT', 'ALGOUSDT', 'LTCUSDT', 'ADAUSDT', 'VETUSDT', 'AAVEUSDT', 'UNIUSDT',
-  // Tier-2 (7 neue validierte Coins)
+  // Tier-2 (7 validierte Coins)
   'OPUSDT', 'FTMUSDT', 'GALAUSDT', 'MANAUSDT', 'ATOMUSDT', 'LDOUSDT', 'SNXUSDT',
+  // Tier-3 (5 validierte Coins)
+  'JUPUSDT', 'PYTHUSDT', 'WLDUSDT', 'NOTUSDT', 'WIFUSDT',
 ];
 
 interface CoinStatus {
