@@ -65,8 +65,10 @@ export interface AnalysisResult {
   stochRsiK: number | null;
   stochRsiD: number | null;
   divergence: 'bullish' | 'bearish' | null;
-  confluenceScore: number | null; // 0-100
-  confluenceBreakdown: string[];   // explanation lines
+  confluenceScore: number | null;
+  confluenceBreakdown: string[];
+  strategy?: 'EMA_CROSS' | 'RSI_BOUNCE';
+  rsiValue?: number | null;
 }
 
 export interface CoinMarketData {

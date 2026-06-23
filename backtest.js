@@ -3,17 +3,21 @@ const { EMA, ATR, ADX } = require('technicalindicators');
 
 // ── Config ─────────────────────────────────────────────────────────────────────
 const COINS = [
-  // Batch 3 — neue ungetestete Coins
-  'PEPEUSDT', 'WIFUSDT', 'JUPUSDT', 'TIAUSDT', 'SEIUSDT',
-  'PYTHUSDT', 'STRKUSDT', 'WLDUSDT', 'FETUSDT', 'RENDERUSDT',
-  'INJUSDT', 'TAOUSDT', 'ONDOUSDT', 'ENAUSDT', 'EIGENUSDT',
-  'POLUSDT', 'NOTUSDT', 'HMSTRUSDT', 'REZUSDT', 'BBUSDT',
+  // Alle 24 validierten Coins
+  'ETHUSDT', 'BNBUSDT', 'XRPUSDT', 'SOLUSDT', 'LINKUSDT',
+  'INJUSDT', 'ALGOUSDT', 'LTCUSDT', 'ADAUSDT', 'VETUSDT', 'AAVEUSDT', 'UNIUSDT',
+  'OPUSDT', 'FTMUSDT', 'GALAUSDT', 'MANAUSDT', 'ATOMUSDT', 'LDOUSDT', 'SNXUSDT',
+  'JUPUSDT', 'PYTHUSDT', 'WLDUSDT', 'NOTUSDT', 'WIFUSDT',
 ];
 const SL_ATR_MULT   = 1.5;
 const MAX_SL_PCT    = 0.08;
 const TP1_R         = 2.0;
 const TP2_R         = 4.0;
 const ADX_PERIOD    = 14;
+const RSI_PERIOD    = 14;
+const RSI_OVERSOLD  = 30;
+const RSI_OVERBOUGHT = 70;
+const STRATEGY      = 'RSI_BOUNCE'; // 'EMA_CROSS' or 'RSI_BOUNCE'
 
 // ── Timeframe config ─────────────────────────────────────────────────────────
 const INTERVAL      = '4h';    // '4h' oder '1h'
@@ -70,6 +74,21 @@ function calcADXSeries(candles, period = ADX_PERIOD) {
     close: candles.map(c => c.close),
     period,
   });
+}
+
+function calcRSI(candles, period = 14) {
+  if (candles.length < period + 1) return null;
+  const closes = candles.map(c => c.close);
+  let gains = 0, losses = 0;
+  for (let i = closes.length - period; i < closes.length; i++) {
+    const diff = closes[i] - closes[i - 1];
+    if (diff > 0) gains += diff; else losses -= diff;
+  }
+  const avgGain = gains / period;
+  const avgLoss = losses / period;
+  if (avgLoss === 0) return 100;
+  const rs = avgGain / avgLoss;
+  return 100 - (100 / (1 + rs));
 }
 
 function calcVolumeRatio(candles, period = 20) {
@@ -272,14 +291,42 @@ async function backtestCoin(symbol, btcCandles) {
     if (i - lastSignalIdx < COOLDOWN) continue;
 
     const btcDir  = isBtc ? null : getBtcDirection(btcCandles, i);
-    const sig     = analyze(candles.slice(0, i + 1), btcDir);
-    if (!sig) continue;
 
-    // 4h trend alignment filter (1h only)
-    if (INTERVAL === '1h' && candles4h) {
-      const trend4h = get4hTrend(candles4h, c.openTime);
-      if (trend4h !== null && trend4h !== sig.direction) continue;
+    let sig = null;
+    if (STRATEGY === 'EMA_CROSS') {
+      sig = analyze(candles.slice(0, i + 1), btcDir);
+      if (sig && INTERVAL === '1h' && candles4h) {
+        const trend4h = get4hTrend(candles4h, c.openTime);
+        if (trend4h !== null && trend4h !== sig.direction) sig = null;
+      }
+    } else if (STRATEGY === 'RSI_BOUNCE') {
+      const slice  = candles.slice(0, i + 1);
+      const closes = slice.map(c => c.close);
+      const ema200s = calcEMASeries(closes, 200);
+      if (ema200s.length < 1) continue;
+      const ema200 = ema200s[ema200s.length - 1];
+      const price  = c.close;
+      const rsi    = calcRSI(slice, RSI_PERIOD);
+      if (rsi === null) continue;
+      // BTC filter
+      const btcOk = btcDir === null || btcDir === 'bullish';
+      const btcShortOk = btcDir === null || btcDir === 'bearish';
+      const atr = calcATR(slice, 14);
+      if (!atr) continue;
+      const riskAmt = Math.min(atr * SL_ATR_MULT, price * MAX_SL_PCT);
+      if (rsi < RSI_OVERSOLD && price > ema200 && btcOk) {
+        const sl  = price - riskAmt;
+        const tp1 = price + riskAmt * TP1_R;
+        const tp2 = price + riskAmt * TP2_R;
+        sig = { direction: 'bullish', entry: price, sl, tp1, tp2, risk: riskAmt };
+      } else if (rsi > RSI_OVERBOUGHT && price < ema200 && btcShortOk) {
+        const sl  = price + riskAmt;
+        const tp1 = price - riskAmt * TP1_R;
+        const tp2 = price - riskAmt * TP2_R;
+        sig = { direction: 'bearish', entry: price, sl, tp1, tp2, risk: riskAmt };
+      }
     }
+    if (!sig) continue;
 
     lastSignalIdx = i;
     activeTrade   = { ...sig, tp1Hit: false };
@@ -289,8 +336,8 @@ async function backtestCoin(symbol, btcCandles) {
 }
 
 async function main() {
-  console.log(`MarketLens Backtest — Walk-Forward ${INTERVAL.toUpperCase()} (Batch 3 / 20 Coins, ${CANDLE_LIMIT} Kerzen)`);
-  console.log(`Filters:  EMA200 macro | BTC master | Vol ${VOL_THRESHOLD}x | ADX rising | Cooldown ${COOLDOWN}*${INTERVAL}${INTERVAL==='1h' ? ' | 4h trend align' : ''}`);
+  console.log(`MarketLens Backtest — Walk-Forward ${INTERVAL.toUpperCase()} (${STRATEGY} / 24 Coins, ${CANDLE_LIMIT} Kerzen)`);
+  console.log(`Filters:  ${STRATEGY === 'RSI_BOUNCE' ? `RSI<${RSI_OVERSOLD}/>  ${RSI_OVERBOUGHT} | EMA200 macro | BTC master | Cooldown ${COOLDOWN}*${INTERVAL}` : `EMA200 macro | BTC master | Vol ${VOL_THRESHOLD}x | ADX rising | Cooldown ${COOLDOWN}*${INTERVAL}`}`);
   console.log('Exits:    TP1=2R (half out, SL→BE) → TP2=4R (full close) = +3R total\n');
 
   let btcCandles = null;

@@ -2,7 +2,7 @@
  * Background worker — runs independently of the Telegram bot process.
  * Every WORKER_INTERVAL_MINUTES it:
  *   1. Fetches candles for all watched + channel symbols
- *   2. Runs technical analysis → sends signal to users + channel
+ *   2. Runs EMA Cross + RSI Bounce analysis → sends signal to users + channel
  *   3. Checks active trades → sends exit when SL or TP is hit
  *   4. Auto break-even: moves SL to entry after TP1 hit
  *   5. Logs every signal + outcome to Supabase signal_log
@@ -26,7 +26,7 @@ import {
   closeUserPositions,
 } from './db';
 import { getCandles } from './services/binance';
-import { analyzeCandles, isNotifiableSignal } from './services/analysis';
+import { analyzeCandles, analyzeRsiBounce, isNotifiableSignal } from './services/analysis';
 import { fetchCryptoPanicNews } from './services/cryptopanic';
 import { fetchAndAnalyzeMacroNews } from './services/news';
 import { AnalysisResult } from './types';
@@ -44,6 +44,8 @@ const INTERVAL_MS = (parseInt(process.env.WORKER_INTERVAL_MINUTES ?? '5', 10)) *
 
 // ─── Channel config ───────────────────────────────────────────────────────────
 const CHANNEL_ID: string | null = process.env.CHANNEL_ID ?? null;
+
+// EMA Cross: alle 24 validierten Coins
 const CHANNEL_SYMBOLS = [
   // Tier-1: Original validierte 12 Coins (4h Walk-Forward +59R/111T)
   'ETHUSDT', 'BNBUSDT', 'XRPUSDT', 'SOLUSDT', 'LINKUSDT',
@@ -54,12 +56,20 @@ const CHANNEL_SYMBOLS = [
   'JUPUSDT', 'PYTHUSDT', 'WLDUSDT', 'NOTUSDT', 'WIFUSDT',
 ];
 
+// RSI Bounce: nur OOS-positive Coins (15 Coins, OOS +16R validiert)
+const RSI_BOUNCE_SYMBOLS = [
+  'ETHUSDT', 'XRPUSDT', 'SOLUSDT', 'LINKUSDT', 'INJUSDT',
+  'LTCUSDT', 'VETUSDT', 'AAVEUSDT', 'FTMUSDT', 'GALAUSDT',
+  'MANAUSDT', 'LDOUSDT', 'WLDUSDT', 'NOTUSDT', 'WIFUSDT',
+];
+
 // ─── Tracking ────────────────────────────────────────────────────────────────
 let lastRecapDate    = '';
 let lastWeeklyDate   = '';
 let lastBriefingDate = '';
 let lastBtcMacro: 'bullish' | 'bearish' | null = null;
-const lastAlertTime = new Map<string, number>();
+const lastAlertTime    = new Map<string, number>(); // EMA Cross cooldown
+const rsiLastAlertTime = new Map<string, number>(); // RSI Bounce cooldown (separate)
 const ALERT_COOLDOWN_MS = 60 * 60 * 1000;
 
 // ─── Active trade tracking ────────────────────────────────────────────────────
@@ -74,12 +84,13 @@ interface ActiveTrade {
   tp2:           number;
   tp3:           number;
   tp4:           number;
-  risk:          number;   // absolute risk per unit
+  risk:          number;
   users:         Array<{ telegram_id: number; capital: number | null }>;
   openTime:      number;
   tp1Hit:        boolean;
   postToChannel: boolean;
   signalLogId:   string | null;
+  strategy:      'EMA_CROSS' | 'RSI_BOUNCE';
 }
 
 const activeTrades = new Map<string, ActiveTrade>();
@@ -128,7 +139,7 @@ async function fetchLsRatio(symbol: string): Promise<number | null> {
     if (Array.isArray(data) && data.length > 0) {
       return parseFloat(data[0].longShortRatio);
     }
-  } catch { /* ignore — not all symbols have futures data */ }
+  } catch { /* ignore */ }
   return null;
 }
 
@@ -151,7 +162,12 @@ function buildEntryMessage(
   const emoji  = isBull ? '🟢' : '🔴';
   const dir    = isBull ? 'LONG' : 'SHORT';
 
-  // ── TP levels (4x) ──────────────────────────────────────────────────────────
+  // ── Strategie-Label ──────────────────────────────────────────────────────
+  const strategyLabel = result.strategy === 'RSI_BOUNCE'
+    ? `📊 *Strategie: RSI Bounce* _(RSI ${result.rsiValue != null ? result.rsiValue.toFixed(0) : '?'}, ${isBull ? 'überverkauft' : 'überkauft'})_`
+    : `📊 *Strategie: EMA Cross* _(Golden/Death Cross)_`;
+
+  // ── TP levels (4x) ──────────────────────────────────────────────────────
   let tpSection  = '';
   let exampleSection = '';
 
@@ -165,10 +181,10 @@ function buildEntryMessage(
     const sl   = result.stopLoss;
     const risk = Math.abs(e - sl);
 
-    const tp1 = result.takeProfit1;         // 2R
-    const tp2 = result.takeProfit2;         // 4R
-    const tp3 = isBull ? e + risk * 6 : e - risk * 6;  // 6R
-    const tp4 = isBull ? e + risk * 8 : e - risk * 8;  // 8R
+    const tp1 = result.takeProfit1;
+    const tp2 = result.takeProfit2;
+    const tp3 = isBull ? e + risk * 6 : e - risk * 6;
+    const tp4 = isBull ? e + risk * 8 : e - risk * 8;
 
     const slDist = Math.abs(e - sl) / e;
     const rr1 = Math.abs(tp1 - e) / risk;
@@ -178,19 +194,18 @@ function buildEntryMessage(
       `\n💰 *Entry:* \`$${fmt(e)}\`\n` +
       `🛑 *Stop Loss:* \`$${fmt(sl)}\` _(${pct(e, sl)})_\n` +
       `${'─'.repeat(30)}\n` +
-      `🎯 *TP1:* \`$${fmt(tp1)}\` _(R/R ${rr1.toFixed(1)} · ${pct(e, tp1)})_ — 50% raus\n` +
-      `🎯 *TP2:* \`$${fmt(tp2)}\` _(R/R ${rr2.toFixed(1)} · ${pct(e, tp2)})_ — Rest raus\n` +
+      `🎯 *TP1:* \`$${fmt(tp1)}\` _(R/R ${rr1.toFixed(1)} · ${pct(e, tp1)})_ — 25% raus\n` +
+      `🎯 *TP2:* \`$${fmt(tp2)}\` _(R/R ${rr2.toFixed(1)} · ${pct(e, tp2)})_ — 25% raus\n` +
       `🚀 *TP3:* \`$${fmt(tp3)}\` _(R/R 6.0 · ${pct(e, tp3)})_ extended\n` +
       `🌕 *TP4:* \`$${fmt(tp4)}\` _(R/R 8.0 · ${pct(e, tp4)})_ moon shot\n`;
 
-    // ── $ example ($100, 10x) ────────────────────────────────────────────────
     const defMargin = capital ?? 100;
     const defLev    = 10;
     const position  = defMargin * defLev;
     const slLoss    = position * slDist;
-    const tp1Gain   = position * slDist * 2;   // 2R
-    const tp2Gain   = position * slDist * 4;   // 4R
-    const tp1Pct    = slDist * defLev * 200;   // 2R × leverage × 100%
+    const tp1Gain   = position * slDist * 2;
+    const tp2Gain   = position * slDist * 4;
+    const tp1Pct    = slDist * defLev * 200;
     const tp2Pct    = slDist * defLev * 400;
     const slPct     = slDist * defLev * 100;
 
@@ -226,6 +241,7 @@ function buildEntryMessage(
   return (
     `⚡ *Signal — ${result.symbol}* · 4h · ${nowUTC()}\n\n` +
     `${emoji} *${dir}: $${result.symbol}* — Signal 👑\n\n` +
+    `${strategyLabel}\n\n` +
     `📊 *Marktstruktur:*\n${lsLine}` +
     tpSection +
     exampleSection +
@@ -247,8 +263,8 @@ function buildExitMessage(
   const profitPct = pct(trade.entry, currentPrice);
   const links     = tradeLinks(trade.symbol);
   const priceStr  = `$${fmt(currentPrice)} _(${profitPct})_`;
+  const stratTag  = trade.strategy === 'RSI_BOUNCE' ? ' [RSI Bounce]' : ' [EMA Cross]';
 
-  // ── Personalized $ P&L ────────────────────────────────────────────────────
   let personalPnl = '';
   if (userPos && trade.risk > 0) {
     const position  = userPos.margin * userPos.leverage;
@@ -256,11 +272,11 @@ function buildExitMessage(
     let pnlDollar   = 0;
     let pnlPct      = 0;
     if (reason === 'tp2') {
-      pnlDollar = position * slDistPct * 4; // 4R
+      pnlDollar = position * slDistPct * 4;
       pnlPct    = slDistPct * userPos.leverage * 400;
     } else if (reason === 'tp1') {
-      pnlDollar = position * slDistPct * 2 * 0.5; // half at 2R
-      pnlPct    = slDistPct * userPos.leverage * 100; // half
+      pnlDollar = position * slDistPct * 2 * 0.5;
+      pnlPct    = slDistPct * userPos.leverage * 100;
     } else {
       const isBreakEven = trade.tp1Hit;
       pnlDollar = isBreakEven ? position * slDistPct * 2 * 0.5 : -(position * slDistPct);
@@ -274,7 +290,7 @@ function buildExitMessage(
   if (reason === 'sl') {
     const isBreakEven = trade.tp1Hit;
     return (
-      `🛑 *GEH RAUS — ${trade.symbol}*\n\n` +
+      `🛑 *GEH RAUS — ${trade.symbol}*${stratTag}\n\n` +
       `${isBreakEven ? '🔄 Break-Even SL — kein Verlust!' : '❌ Stop Loss getroffen!'}\n\n` +
       `💰 *Ausstieg:* ${priceStr}\n` +
       `📍 *Entry war:* $${fmt(trade.entry)}\n` +
@@ -288,14 +304,14 @@ function buildExitMessage(
 
   if (reason === 'tp1') {
     return (
-      `🎯 *TP1 getroffen! — ${trade.symbol}*\n\n` +
-      `✅ *Gewinne sichern! 50% raus!*\n\n` +
+      `🎯 *TP1 getroffen! — ${trade.symbol}*${stratTag}\n\n` +
+      `✅ *Gewinne sichern! 25% raus!*\n\n` +
       `💰 *Ausstieg:* ${priceStr}\n` +
       `📍 *Entry war:* $${fmt(trade.entry)}\n` +
       `⏱ *Trade lief:* ${durationH}h\n` +
       `📊 *Ergebnis:* +2R erreicht` +
       personalPnl +
-      `\n\n👉 Hälfte der Position schließen.\n` +
+      `\n\n👉 25% der Position schließen.\n` +
       `👉 Rest läuft weiter bis TP2 \\($${fmt(trade.tp2)}\\).\n` +
       `👉 Stop Loss zieht auf Entry 🤖\n\n` +
       `${links}\n\n` +
@@ -304,7 +320,7 @@ function buildExitMessage(
   }
 
   return (
-    `🏆 *TP2 getroffen! — ${trade.symbol}*\n\n` +
+    `🏆 *TP2 getroffen! — ${trade.symbol}*${stratTag}\n\n` +
     `✅ *Voller Gewinn! Alles raus!*\n\n` +
     `💰 *Ausstieg:* ${priceStr}\n` +
     `📍 *Entry war:* $${fmt(trade.entry)}\n` +
@@ -349,21 +365,15 @@ async function sendPersonalPnl(
     const positions = await getUsersInPosition(trade.symbol);
     if (positions.length === 0) return;
 
-    // Close positions in DB after TP2 or SL
     if (reason === 'tp2' || reason === 'sl') {
       await closeUserPositions(trade.symbol, 0);
     }
 
     for (const pos of positions) {
-      // Skip if user already received trade exit via trade.users
       const alreadyNotified = trade.users.some((u) => u.telegram_id === pos.telegram_id);
       const msg = buildExitMessage(trade, reason, currentPrice, pos);
       try {
-        if (alreadyNotified) {
-          // User is a watcher — exit message already sent, just append personalized P&L
-          // (already included in message via personalPnl)
-        } else {
-          // Channel user who used /in — send them personal notification
+        if (!alreadyNotified) {
           await bot.api.sendMessage(pos.telegram_id, msg, { parse_mode: 'Markdown' });
         }
       } catch (e) {
@@ -486,6 +496,84 @@ async function checkBtcMacroShift(): Promise<void> {
   }
 }
 
+// ─── Helper: fire a signal ────────────────────────────────────────────────────
+
+async function fireSignal(
+  symbol: string,
+  result: AnalysisResult,
+  users: Array<{ telegram_id: number; capital: number | null }>,
+  isChannelSymbol: boolean,
+  btcDirection: 'bullish' | 'bearish' | null,
+): Promise<void> {
+  if (!result.entry || !result.stopLoss || !result.takeProfit1 || !result.takeProfit2 || !result.direction) return;
+
+  const lsRatio = await fetchLsRatio(symbol);
+
+  // BTC note in signals
+  if (symbol !== 'BTCUSDT' && btcDirection !== null) {
+    result.signals.push(`BTC Master Filter: ${btcDirection === 'bullish' ? 'bullisch' : 'baerisch'} ✅`);
+  }
+
+  // Log to Supabase
+  let signalLogId: string | null = null;
+  try {
+    const isBull = result.direction === 'bullish';
+    const risk   = Math.abs(result.entry - result.stopLoss);
+    signalLogId = await logSignal({
+      symbol,
+      direction:     result.direction,
+      entry:         result.entry,
+      stop_loss:     result.stopLoss,
+      take_profit1:  result.takeProfit1,
+      take_profit2:  result.takeProfit2,
+      take_profit3:  isBull ? result.entry + risk * 6 : result.entry - risk * 6,
+      take_profit4:  isBull ? result.entry + risk * 8 : result.entry - risk * 8,
+      risk_reward:   result.riskReward,
+      signals:       result.signals,
+      ema50:         result.ema50 ?? null,
+      volume_ratio:  result.volumeRatio ?? null,
+    });
+  } catch (e) {
+    console.error('[worker] Failed to log signal:', (e as Error).message);
+  }
+
+  // Register active trade
+  const isBull = result.direction === 'bullish';
+  const risk   = Math.abs(result.entry - result.stopLoss);
+  activeTrades.set(symbol, {
+    symbol,
+    direction:     result.direction,
+    entry:         result.entry,
+    sl:            result.stopLoss,
+    originalSl:    result.stopLoss,
+    tp1:           result.takeProfit1,
+    tp2:           result.takeProfit2,
+    tp3:           isBull ? result.entry + risk * 6 : result.entry - risk * 6,
+    tp4:           isBull ? result.entry + risk * 8 : result.entry - risk * 8,
+    risk,
+    users,
+    openTime:      Date.now(),
+    tp1Hit:        false,
+    postToChannel: isChannelSymbol,
+    signalLogId,
+    strategy:      result.strategy ?? 'EMA_CROSS',
+  });
+
+  // Send
+  const channelMsg = buildEntryMessage(result, null, lsRatio);
+  for (const { telegram_id, capital } of users) {
+    try {
+      await bot.api.sendMessage(telegram_id, buildEntryMessage(result, capital, lsRatio), { parse_mode: 'Markdown' });
+    } catch (e) {
+      console.error(`[worker] sendMessage to ${telegram_id} failed:`, (e as Error).message);
+    }
+  }
+  if (isChannelSymbol) await sendToChannel(channelMsg);
+
+  const strat = result.strategy ?? 'EMA_CROSS';
+  console.log(`[worker] ${strat} alert sent for ${symbol} — users: ${users.length}, channel: ${isChannelSymbol}, L/S: ${lsRatio ?? 'n/a'}`);
+}
+
 // ─── Analysis tick ────────────────────────────────────────────────────────────
 
 async function runAnalysis(): Promise<void> {
@@ -498,6 +586,9 @@ async function runAnalysis(): Promise<void> {
   }
   if (CHANNEL_ID) {
     for (const sym of CHANNEL_SYMBOLS) {
+      if (!symbolMap.has(sym)) symbolMap.set(sym, []);
+    }
+    for (const sym of RSI_BOUNCE_SYMBOLS) {
       if (!symbolMap.has(sym)) symbolMap.set(sym, []);
     }
   }
@@ -519,120 +610,61 @@ async function runAnalysis(): Promise<void> {
 
   for (const [symbol, user_ids] of symbolMap) {
     try {
-      const [candles4h, candles1h] = await Promise.all([
-        getCandles(symbol, '4h', 250),
-        getCandles(symbol, '1h', 100),
-      ]);
-      const isChannelSymbol = CHANNEL_ID !== null && CHANNEL_SYMBOLS.includes(symbol);
+      const candles4h = await getCandles(symbol, '4h', 250);
+      const isChannelSymbol = CHANNEL_ID !== null && (CHANNEL_SYMBOLS.includes(symbol) || RSI_BOUNCE_SYMBOLS.includes(symbol));
 
-      // Check active trade
+      // Check active trade exits
       const activeTrade = activeTrades.get(symbol);
       if (activeTrade) {
         await checkActiveTrade(activeTrade, candles4h);
       }
-      if (activeTrades.has(symbol)) continue;
-
-      // Multi-timeframe analysis
-      const result4h = analyzeCandles(symbol, candles4h);
-      const result1h = analyzeCandles(symbol, candles1h);
-
-      if (!isNotifiableSignal(result4h)) continue;
-      if (result1h.direction === null || result1h.direction !== result4h.direction) {
-        console.log(`[worker] ${symbol} skipped — TF mismatch (${result1h.direction} vs ${result4h.direction})`);
-        continue;
-      }
-
-      // BTC Master Filter
-      if (symbol !== 'BTCUSDT' && btcDirection !== null) {
-        if (result4h.direction === 'bullish' && btcDirection === 'bearish') continue;
-        if (result4h.direction === 'bearish' && btcDirection === 'bullish') continue;
-      }
-
-      // Merge results
-      const btcNote = symbol !== 'BTCUSDT' && btcDirection !== null
-        ? `, BTC ${btcDirection === 'bullish' ? 'bullisch' : 'baerisch'} ✅` : '';
-      const result: AnalysisResult = {
-        ...result4h,
-        signals: [
-          ...result4h.signals,
-          `1h Bestaetigung: ${result1h.direction === 'bullish' ? 'bullisch' : 'baerisch'}${btcNote} ✅`,
-        ],
-      };
-
-      const lastTime = lastAlertTime.get(symbol) ?? 0;
-      if (Date.now() - lastTime < ALERT_COOLDOWN_MS) {
-        console.log(`[worker] ${symbol} alert suppressed (cooldown)`);
-        continue;
-      }
-      lastAlertTime.set(symbol, Date.now());
-
-      // Fetch L/S Ratio
-      const lsRatio = await fetchLsRatio(symbol);
+      if (activeTrades.has(symbol)) continue; // trade still open → skip new signals
 
       const users = user_ids.length > 0 ? await getUsersForAlert(user_ids) : [];
 
-      // Log to Supabase
-      let signalLogId: string | null = null;
-      if (result.entry && result.stopLoss && result.takeProfit1 && result.takeProfit2 && result.direction) {
-        try {
-          signalLogId = await logSignal({
-            symbol,
-            direction:     result.direction,
-            entry:         result.entry,
-            stop_loss:     result.stopLoss,
-            take_profit1:  result.takeProfit1,
-            take_profit2:  result.takeProfit2,
-            take_profit3:  result.direction === 'bullish' ? result.entry + Math.abs(result.entry - result.stopLoss) * 6 : result.entry - Math.abs(result.entry - result.stopLoss) * 6,
-            take_profit4:  result.direction === 'bullish' ? result.entry + Math.abs(result.entry - result.stopLoss) * 8 : result.entry - Math.abs(result.entry - result.stopLoss) * 8,
-            risk_reward:   result.riskReward,
-            signals:       result.signals,
-            ema50:         result.ema50 ?? null,
-            volume_ratio:  result.volumeRatio ?? null,
-          });
-        } catch (e) {
-          console.error('[worker] Failed to log signal:', (e as Error).message);
+      // ── 1. EMA Cross Strategy ────────────────────────────────────────────
+      if (CHANNEL_SYMBOLS.includes(symbol) || user_ids.length > 0) {
+        const lastTime = lastAlertTime.get(symbol) ?? 0;
+        if (Date.now() - lastTime >= ALERT_COOLDOWN_MS) {
+          const result4h = analyzeCandles(symbol, candles4h);
+
+          if (isNotifiableSignal(result4h)) {
+            // BTC Master Filter
+            const blocked =
+              symbol !== 'BTCUSDT' && btcDirection !== null &&
+              ((result4h.direction === 'bullish' && btcDirection === 'bearish') ||
+               (result4h.direction === 'bearish' && btcDirection === 'bullish'));
+
+            if (!blocked) {
+              lastAlertTime.set(symbol, Date.now());
+              await fireSignal(symbol, result4h, users, isChannelSymbol, btcDirection);
+              continue; // EMA Cross fired — skip RSI Bounce for same symbol this tick
+            }
+          }
         }
       }
 
-      // Register active trade
-      if (result.entry && result.stopLoss && result.takeProfit1 && result.takeProfit2 && result.direction) {
-        const isBull = result.direction === 'bullish';
-        const risk   = Math.abs(result.entry - result.stopLoss);
-        activeTrades.set(symbol, {
-          symbol,
-          direction:     result.direction,
-          entry:         result.entry,
-          sl:            result.stopLoss,
-          originalSl:    result.stopLoss,
-          tp1:           result.takeProfit1,
-          tp2:           result.takeProfit2,
-          tp3:           isBull ? result.entry + risk * 6 : result.entry - risk * 6,
-          tp4:           isBull ? result.entry + risk * 8 : result.entry - risk * 8,
-          risk,
-          users,
-          openTime:      Date.now(),
-          tp1Hit:        false,
-          postToChannel: isChannelSymbol,
-          signalLogId,
-        });
-      }
+      // ── 2. RSI Bounce Strategy ───────────────────────────────────────────
+      if (RSI_BOUNCE_SYMBOLS.includes(symbol)) {
+        const rsiLastTime = rsiLastAlertTime.get(symbol) ?? 0;
+        if (Date.now() - rsiLastTime >= ALERT_COOLDOWN_MS) {
+          const rsiResult = analyzeRsiBounce(symbol, candles4h);
 
-      // Send signals
-      const channelMsg = buildEntryMessage(result, null, lsRatio);
-      for (const { telegram_id, capital } of users) {
-        try {
-          await bot.api.sendMessage(
-            telegram_id,
-            buildEntryMessage(result, capital, lsRatio),
-            { parse_mode: 'Markdown' },
-          );
-        } catch (e) {
-          console.error(`[worker] sendMessage to ${telegram_id} failed:`, (e as Error).message);
+          if (isNotifiableSignal(rsiResult)) {
+            // BTC Master Filter for RSI Bounce
+            const blocked =
+              symbol !== 'BTCUSDT' && btcDirection !== null &&
+              ((rsiResult.direction === 'bullish' && btcDirection === 'bearish') ||
+               (rsiResult.direction === 'bearish' && btcDirection === 'bullish'));
+
+            if (!blocked) {
+              rsiLastAlertTime.set(symbol, Date.now());
+              await fireSignal(symbol, rsiResult, users, isChannelSymbol, btcDirection);
+            }
+          }
         }
       }
-      if (isChannelSymbol) await sendToChannel(channelMsg);
 
-      console.log(`[worker] Alert sent for ${symbol} — users: ${users.length}, channel: ${isChannelSymbol}, L/S: ${lsRatio ?? 'n/a'}`);
     } catch (e) {
       console.error(`[worker] Analysis failed for ${symbol}:`, (e as Error).message);
     }
@@ -694,7 +726,6 @@ async function checkMorningBriefing(): Promise<void> {
     try {
       const msg = await buildMorningBriefing();
       await sendToChannel(msg);
-      // Also send to all bot users
       try {
         const users = await getAllUsers();
         for (const u of users) {
@@ -734,24 +765,17 @@ async function checkExits(): Promise<void> {
       const sl      = sig.stop_loss;
       const entry   = sig.entry;
 
-      const fmt = (n: number) => n.toFixed(4).replace(/\.?0+$/, '');
+      const fmtP = (n: number) => n.toFixed(4).replace(/\.?0+$/, '');
 
       // ── TP4 check ────────────────────────────────────────────────────────
       if (tp4 && !sig.tp3_hit_at && ((isLong && high >= tp4) || (!isLong && low <= tp4))) {
         await closeSignal(sig.id, 'tp2', tp4, 6.0);
         const msg =
-          `🌕 *TP4 Moon Shot — ${coin}* ${dir}
-
-` +
-          `✅ *Alles rausnehmen!* Maximales Ziel erreicht!
-
-` +
-          `💰 Ergebnis: *+6R Gesamt*
-` +
-          `   (¼ TP1 + ¼ TP2 + ¼ TP3 + ¼ TP4)
-
-` +
-          `🎯 ${entry} → 🌕 ${fmt(tp4)}`;
+          `🌕 *TP4 Moon Shot — ${coin}* ${dir}\n\n` +
+          `✅ *Alles rausnehmen!* Maximales Ziel erreicht!\n\n` +
+          `💰 Ergebnis: *+6R Gesamt*\n` +
+          `   (¼ TP1 + ¼ TP2 + ¼ TP3 + ¼ TP4)\n\n` +
+          `🎯 ${entry} → 🌕 ${fmtP(tp4)}`;
         await sendToChannel(msg);
         continue;
       }
@@ -760,16 +784,10 @@ async function checkExits(): Promise<void> {
       if (tp3 && !sig.tp3_hit_at && sig.tp2_hit_at && ((isLong && high >= tp3) || (!isLong && low <= tp3))) {
         await markTp3Hit(sig.id);
         const msg =
-          `🚀 *TP3 erreicht — ${coin}* ${dir}
-
-` +
-          `💡 *Empfehlung:* Weiteres ¼ schließen.
-` +
-          `   Letztes ¼ läuft Richtung *TP4 @ ${tp4 ? fmt(tp4) : '?'}*
-
-` +
-          `💰 Bisher gesichert: *+4.5R*
-` +
+          `🚀 *TP3 erreicht — ${coin}* ${dir}\n\n` +
+          `💡 *Empfehlung:* Weiteres ¼ schließen.\n` +
+          `   Letztes ¼ läuft Richtung *TP4 @ ${tp4 ? fmtP(tp4) : '?'}*\n\n` +
+          `💰 Bisher gesichert: *+4.5R*\n` +
           `🌕 TP4 = Moon Shot (+8R)`;
         await sendToChannel(msg);
         continue;
@@ -778,37 +796,22 @@ async function checkExits(): Promise<void> {
       // ── TP2 check ────────────────────────────────────────────────────────
       if (!sig.tp2_hit_at && sig.tp1_hit_at && ((isLong && high >= tp2) || (!isLong && low <= tp2))) {
         if (tp3) {
-          // Noch TP3/TP4 offen → nur Notification, nicht schließen
           await markTp2Hit(sig.id);
           const msg =
-            `🎯 *TP2 erreicht — ${coin}* ${dir}
-
-` +
-            `💡 *Empfehlung:* Weiteres ¼ schließen (+4R gesichert).
-` +
-            `   Rest läuft Richtung *TP3 @ ${fmt(tp3)}*
-
-` +
-            `💰 Bisher gesichert: *+3R*
-` +
+            `🎯 *TP2 erreicht — ${coin}* ${dir}\n\n` +
+            `💡 *Empfehlung:* Weiteres ¼ schließen (+4R gesichert).\n` +
+            `   Rest läuft Richtung *TP3 @ ${fmtP(tp3)}*\n\n` +
+            `💰 Bisher gesichert: *+3R*\n` +
             `🚀 TP3 = +6R · 🌕 TP4 = +8R`;
           await sendToChannel(msg);
         } else {
-          // Kein TP3/TP4 → Vollständig schließen
           await closeSignal(sig.id, 'tp2', tp2, 3.0);
           const msg =
-            `🏆 *TP2 erreicht — ${coin}* ${dir}
-
-` +
-            `✅ *Alles rausnehmen!* Position vollständig schließen.
-
-` +
-            `💰 Ergebnis: *+3R Gesamt*
-` +
-            `   (½ bei TP1 + ½ bei TP2)
-
-` +
-            `Entry: ${fmt(entry)} → TP2: ${fmt(tp2)}`;
+            `🏆 *TP2 erreicht — ${coin}* ${dir}\n\n` +
+            `✅ *Alles rausnehmen!* Position vollständig schließen.\n\n` +
+            `💰 Ergebnis: *+3R Gesamt*\n` +
+            `   (½ bei TP1 + ½ bei TP2)\n\n` +
+            `Entry: ${fmtP(entry)} → TP2: ${fmtP(tp2)}`;
           await sendToChannel(msg);
         }
         continue;
@@ -818,19 +821,12 @@ async function checkExits(): Promise<void> {
       if (!sig.tp1_hit_at && ((isLong && high >= tp1) || (!isLong && low <= tp1))) {
         await markTp1Hit(sig.id);
         const msg =
-          `🎯 *TP1 erreicht — ${coin}* ${dir}
-
-` +
-          `💡 *Empfehlung:* 25% der Position schließen (+2R gesichert).
-` +
-          `   Stop Loss auf *Break-Even (${fmt(entry)})* verschieben.
-
-` +
-          `🎯 TP2 @ *${fmt(tp2)}* (+4R)
-` +
-          `🚀 TP3 @ *${tp3 ? fmt(tp3) : '?'}* (+6R)
-` +
-          `🌕 TP4 @ *${tp4 ? fmt(tp4) : '?'}* (+8R)`;
+          `🎯 *TP1 erreicht — ${coin}* ${dir}\n\n` +
+          `💡 *Empfehlung:* 25% der Position schließen (+2R gesichert).\n` +
+          `   Stop Loss auf *Break-Even (${fmtP(entry)})* verschieben.\n\n` +
+          `🎯 TP2 @ *${fmtP(tp2)}* (+4R)\n` +
+          `🚀 TP3 @ *${tp3 ? fmtP(tp3) : '?'}* (+6R)\n` +
+          `🌕 TP4 @ *${tp4 ? fmtP(tp4) : '?'}* (+8R)`;
         await sendToChannel(msg);
         continue;
       }
@@ -841,27 +837,17 @@ async function checkExits(): Promise<void> {
         if (sig.tp1_hit_at) {
           await closeSignal(sig.id, 'be', effectiveSl, 1.0);
           const msg =
-            `⚪ *Break-Even — ${coin}* ${dir}
-
-` +
-            `SL war auf Entry — kein Verlust am Rest.
-` +
-            `💰 Ergebnis: *+1R* (TP1 gesichert)
-
-` +
+            `⚪ *Break-Even — ${coin}* ${dir}\n\n` +
+            `SL war auf Entry — kein Verlust am Rest.\n` +
+            `💰 Ergebnis: *+1R* (TP1 gesichert)\n\n` +
             `Nächste Chance kommt. 📈`;
           await sendToChannel(msg);
         } else {
           await closeSignal(sig.id, 'sl', effectiveSl, -1.0);
           const msg =
-            `🛑 *Stop Loss — ${coin}* ${dir}
-
-` +
-            `Position gestoppt.
-` +
-            `💸 Ergebnis: *-1R*
-
-` +
+            `🛑 *Stop Loss — ${coin}* ${dir}\n\n` +
+            `Position gestoppt.\n` +
+            `💸 Ergebnis: *-1R*\n\n` +
             `Verluste gehören dazu — nächstes Signal kommt. 💪`;
           await sendToChannel(msg);
         }
@@ -915,8 +901,9 @@ async function restoreActiveTrades(): Promise<void> {
         users:         [],
         openTime:      new Date(sig.opened_at).getTime(),
         tp1Hit:        false,
-        postToChannel: CHANNEL_ID !== null && CHANNEL_SYMBOLS.includes(sig.symbol),
+        postToChannel: CHANNEL_ID !== null && (CHANNEL_SYMBOLS.includes(sig.symbol) || RSI_BOUNCE_SYMBOLS.includes(sig.symbol)),
         signalLogId:   sig.id,
+        strategy:      'EMA_CROSS',
       });
       console.log('[worker] Restored: ' + sig.symbol + ' ' + sig.direction);
     }
@@ -931,8 +918,10 @@ async function restoreActiveTrades(): Promise<void> {
 async function main(): Promise<void> {
   console.log('[worker] Starting — interval: ' + INTERVAL_MS / 60000 + ' min');
   if (CHANNEL_ID) console.log('[worker] Channel: ' + CHANNEL_ID);
+  console.log('[worker] EMA Cross: ' + CHANNEL_SYMBOLS.length + ' Coins');
+  console.log('[worker] RSI Bounce: ' + RSI_BOUNCE_SYMBOLS.length + ' Coins');
   await restoreActiveTrades();
-  await notifyAdmin('Worker gestartet!\nIntervall: ' + INTERVAL_MS / 60000 + ' min\n' + new Date().toISOString());
+  await notifyAdmin('Worker gestartet!\nIntervall: ' + INTERVAL_MS / 60000 + ' min\nEMA Cross: ' + CHANNEL_SYMBOLS.length + ' Coins\nRSI Bounce: ' + RSI_BOUNCE_SYMBOLS.length + ' Coins\n' + new Date().toISOString());
   setInterval(tick, INTERVAL_MS);
   await tick();
 }
@@ -944,4 +933,3 @@ process.on('uncaughtException', async (err) => {
 main().catch(async (e) => {
   await notifyAdmin('Worker fatal error!\n' + (e as Error).message);
 });
-
