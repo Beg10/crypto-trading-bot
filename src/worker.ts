@@ -27,6 +27,7 @@ import {
 } from './db';
 import { getCandles } from './services/binance';
 import { analyzeCandles, analyzeRsiBounce, isNotifiableSignal } from './services/analysis';
+import { getFundingRate, getOpenInterestDelta, evaluatePerpConfluence } from './services/perp';
 import { fetchCryptoPanicNews } from './services/cryptopanic';
 import { fetchAndAnalyzeMacroNews } from './services/news';
 import { AnalysisResult } from './types';
@@ -41,6 +42,10 @@ if (!process.env.BOT_TOKEN) {
 
 const bot = new Bot(process.env.BOT_TOKEN);
 const INTERVAL_MS = (parseInt(process.env.WORKER_INTERVAL_MINUTES ?? '5', 10)) * 60 * 1000;
+
+// Quality filter: max concurrent open trades. Protects against multiple
+// correlated alt-positions all dumping together on a BTC move.
+const MAX_OPEN_TRADES = parseInt(process.env.MAX_OPEN_TRADES ?? '5', 10);
 
 // ─── Channel config ───────────────────────────────────────────────────────────
 const CHANNEL_ID: string | null = process.env.CHANNEL_ID ?? null;
@@ -589,6 +594,44 @@ async function fireSignal(
   console.log(`[worker] ${strat} alert sent for ${symbol} — users: ${users.length} (dm=${dmDelivered}), channel: ${channelDelivered}, L/S: ${lsRatio ?? 'n/a'}`);
 }
 
+// ─── Quality filters (perp confluence + correlation cap) ─────────────────────
+//
+// Runs AFTER the BTC master filter, BEFORE fireSignal. Returns true if signal
+// should fire. Mutates result.signals/confluenceBreakdown to surface positive
+// confluence reasons in the user-facing message.
+
+async function passesQualityFilters(symbol: string, result: AnalysisResult): Promise<boolean> {
+  if (!result.direction) return false;
+
+  // 1. Correlation cap — don't open more than N positions at once.
+  if (activeTrades.size >= MAX_OPEN_TRADES) {
+    console.log(`[filter] ${symbol}: BLOCKED — ${activeTrades.size}/${MAX_OPEN_TRADES} open trades, correlation cap hit`);
+    return false;
+  }
+
+  // 2. Perp confluence — funding rate + open-interest delta. Best-effort:
+  //    if Binance Futures has no data for this symbol, skip the check.
+  const [funding, oi] = await Promise.all([
+    getFundingRate(symbol),
+    getOpenInterestDelta(symbol, '4h'),
+  ]);
+  const verdict = evaluatePerpConfluence(result.direction, funding, oi?.deltaPct ?? null);
+
+  if (verdict.verdict === 'block') {
+    console.log(`[filter] ${symbol}: BLOCKED — ${verdict.reason}`);
+    return false;
+  }
+
+  if (verdict.reason) {
+    // Surface the perp reason in the signal message so users see WHY it's high-quality.
+    result.signals.push(verdict.reason);
+    if (result.confluenceBreakdown) result.confluenceBreakdown.push(verdict.reason);
+  }
+
+  console.log(`[filter] ${symbol}: PASS — funding=${funding?.toFixed(5) ?? 'n/a'}, OI Δ=${oi?.deltaPct.toFixed(1) ?? 'n/a'}%, open=${activeTrades.size}/${MAX_OPEN_TRADES}`);
+  return true;
+}
+
 // ─── Analysis tick ────────────────────────────────────────────────────────────
 
 async function runAnalysis(): Promise<void> {
@@ -653,7 +696,7 @@ async function runAnalysis(): Promise<void> {
               ((result4h.direction === 'bullish' && btcDirection === 'bearish') ||
                (result4h.direction === 'bearish' && btcDirection === 'bullish'));
 
-            if (!blocked) {
+            if (!blocked && await passesQualityFilters(symbol, result4h)) {
               lastAlertTime.set(symbol, Date.now());
               await fireSignal(symbol, result4h, users, isChannelSymbol, btcDirection);
               continue; // EMA Cross fired — skip RSI Bounce for same symbol this tick
@@ -677,7 +720,7 @@ async function runAnalysis(): Promise<void> {
               ((rsiResult.direction === 'bullish' && btcDirection === 'bearish') ||
                (rsiResult.direction === 'bearish' && btcDirection === 'bullish'));
 
-            if (!blocked) {
+            if (!blocked && await passesQualityFilters(symbol, rsiResult)) {
               rsiLastAlertTime.set(symbol, Date.now());
               await fireSignal(symbol, rsiResult, users, isChannelSymbol, btcDirection);
             }
