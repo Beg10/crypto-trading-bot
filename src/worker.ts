@@ -618,7 +618,11 @@ async function runAnalysis(): Promise<void> {
       if (activeTrade) {
         await checkActiveTrade(activeTrade, candles4h);
       }
-      if (activeTrades.has(symbol)) continue; // trade still open → skip new signals
+      if (activeTrades.has(symbol)) {
+        console.log(`[dbg] ${symbol}: skipped (active trade)`);
+        continue; // trade still open → skip new signals
+      }
+      console.log(`[dbg] ${symbol}: processing...`);
 
       const users = user_ids.length > 0 ? await getUsersForAlert(user_ids) : [];
 
