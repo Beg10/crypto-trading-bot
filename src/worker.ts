@@ -334,12 +334,16 @@ function buildExitMessage(
 
 // ─── Send helpers ─────────────────────────────────────────────────────────────
 
-async function sendToChannel(message: string): Promise<void> {
-  if (!CHANNEL_ID) return;
+async function sendToChannel(message: string): Promise<boolean> {
+  if (!CHANNEL_ID) return false;
   try {
     await bot.api.sendMessage(CHANNEL_ID, message, { parse_mode: 'Markdown' });
+    return true;
   } catch (e) {
     console.error('[worker] Channel send failed:', (e as Error).message);
+    // Loud fallback: tell the admin that the channel is broken so signals don't go dark.
+    await notifyAdmin(`⚠️ Channel send failed: ${(e as Error).message}\n\nCHANNEL_ID="${CHANNEL_ID}"`);
+    return false;
   }
 }
 
@@ -561,17 +565,28 @@ async function fireSignal(
 
   // Send
   const channelMsg = buildEntryMessage(result, null, lsRatio);
+  let dmDelivered = 0;
   for (const { telegram_id, capital } of users) {
     try {
       await bot.api.sendMessage(telegram_id, buildEntryMessage(result, capital, lsRatio), { parse_mode: 'Markdown' });
+      dmDelivered++;
     } catch (e) {
       console.error(`[worker] sendMessage to ${telegram_id} failed:`, (e as Error).message);
     }
   }
-  if (isChannelSymbol) await sendToChannel(channelMsg);
+  const channelDelivered = isChannelSymbol ? await sendToChannel(channelMsg) : false;
+
+  // Safety-net: if nobody got the signal, route it to the admin so it doesn't go dark.
+  if (dmDelivered === 0 && !channelDelivered) {
+    await notifyAdmin(
+      `🚨 *Signal ohne Empfänger!* — ${symbol}\n` +
+      `users=${users.length}, isChannelSymbol=${isChannelSymbol}, CHANNEL_ID=${CHANNEL_ID ?? 'unset'}\n\n` +
+      channelMsg,
+    );
+  }
 
   const strat = result.strategy ?? 'EMA_CROSS';
-  console.log(`[worker] ${strat} alert sent for ${symbol} — users: ${users.length}, channel: ${isChannelSymbol}, L/S: ${lsRatio ?? 'n/a'}`);
+  console.log(`[worker] ${strat} alert sent for ${symbol} — users: ${users.length} (dm=${dmDelivered}), channel: ${channelDelivered}, L/S: ${lsRatio ?? 'n/a'}`);
 }
 
 // ─── Analysis tick ────────────────────────────────────────────────────────────
@@ -923,8 +938,22 @@ async function restoreActiveTrades(): Promise<void> {
 async function main(): Promise<void> {
   console.log('[worker] Starting — interval: ' + INTERVAL_MS / 60000 + ' min');
   if (CHANNEL_ID) console.log('[worker] Channel: ' + CHANNEL_ID);
+  else console.warn('[worker] ⚠️ CHANNEL_ID not set — channel signals will be sent to admin DM only');
   console.log('[worker] EMA Cross: ' + CHANNEL_SYMBOLS.length + ' Coins');
   console.log('[worker] RSI Bounce: ' + RSI_BOUNCE_SYMBOLS.length + ' Coins');
+
+  // Sanity-test the channel right at startup — if it's broken, fail loud now,
+  // not silently 6 hours later when a signal fires.
+  if (CHANNEL_ID) {
+    try {
+      await bot.api.sendMessage(CHANNEL_ID, '✅ Worker connected to channel');
+    } catch (e) {
+      await notifyAdmin(`⚠️ *Channel-Test fehlgeschlagen!* — CHANNEL_ID="${CHANNEL_ID}"\n\`${(e as Error).message}\`\n\nSignale gehen heute NUR an Admin DM bis das gefixt ist.`);
+    }
+  } else {
+    await notifyAdmin('⚠️ CHANNEL_ID ist nicht gesetzt — Signale ohne private Watcher gehen nur an dich (Admin).');
+  }
+
   await restoreActiveTrades();
   await notifyAdmin('Worker gestartet!\nIntervall: ' + INTERVAL_MS / 60000 + ' min\nEMA Cross: ' + CHANNEL_SYMBOLS.length + ' Coins\nRSI Bounce: ' + RSI_BOUNCE_SYMBOLS.length + ' Coins\n' + new Date().toISOString());
   setInterval(tick, INTERVAL_MS);
