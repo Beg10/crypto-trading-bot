@@ -649,6 +649,8 @@ async function runAnalysis(): Promise<void> {
         const rsiLastTime = rsiLastAlertTime.get(symbol) ?? 0;
         if (Date.now() - rsiLastTime >= ALERT_COOLDOWN_MS) {
           const rsiResult = analyzeRsiBounce(symbol, candles4h);
+          const rsiVal = rsiResult.rsiValue ?? rsiResult.rsi;
+          console.log(`[rsi] ${symbol}: RSI=${rsiVal?.toFixed(1) ?? 'n/a'} dir=${rsiResult.direction ?? 'none'} entry=${rsiResult.entry?.toFixed(4) ?? 'null'}`);
 
           if (isNotifiableSignal(rsiResult)) {
             // BTC Master Filter for RSI Bounce
