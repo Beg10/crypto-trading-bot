@@ -584,13 +584,12 @@ async function runAnalysis(): Promise<void> {
   for (const { symbol, user_ids } of watched) {
     symbolMap.set(symbol, user_ids);
   }
-  if (CHANNEL_ID) {
-    for (const sym of CHANNEL_SYMBOLS) {
-      if (!symbolMap.has(sym)) symbolMap.set(sym, []);
-    }
-    for (const sym of RSI_BOUNCE_SYMBOLS) {
-      if (!symbolMap.has(sym)) symbolMap.set(sym, []);
-    }
+  // CHANNEL_SYMBOLS + RSI_BOUNCE_SYMBOLS immer scannen (unabhängig von CHANNEL_ID)
+  for (const sym of CHANNEL_SYMBOLS) {
+    if (!symbolMap.has(sym)) symbolMap.set(sym, []);
+  }
+  for (const sym of RSI_BOUNCE_SYMBOLS) {
+    if (!symbolMap.has(sym)) symbolMap.set(sym, []);
   }
 
   if (symbolMap.size === 0) {
