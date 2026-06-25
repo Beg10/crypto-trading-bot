@@ -310,6 +310,40 @@ export async function getWeeklySignals(): Promise<SignalLogEntry[]> {
   return (data ?? []) as SignalLogEntry[];
 }
 
+/**
+ * Per-symbol performance summary over the past N days, used by the auto-disable
+ * loop in the worker. Only closed trades count (result_r IS NOT NULL).
+ */
+export interface SymbolPerformance {
+  symbol: string;
+  trades: number;
+  rSum:   number;
+  wins:   number;
+  losses: number;
+}
+
+export async function getSymbolPerformance(days = 60): Promise<SymbolPerformance[]> {
+  const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+  const { data, error } = await supabase
+    .from('signal_log')
+    .select('symbol, result_r')
+    .gte('opened_at', since)
+    .not('result_r', 'is', null);
+
+  if (error) throw new Error(`DB getSymbolPerformance: ${error.message}`);
+
+  const map = new Map<string, SymbolPerformance>();
+  for (const row of (data ?? []) as Array<{ symbol: string; result_r: number }>) {
+    const cur = map.get(row.symbol) ?? { symbol: row.symbol, trades: 0, rSum: 0, wins: 0, losses: 0 };
+    cur.trades += 1;
+    cur.rSum   += row.result_r;
+    if (row.result_r > 0) cur.wins   += 1;
+    else                  cur.losses += 1;
+    map.set(row.symbol, cur);
+  }
+  return Array.from(map.values());
+}
+
 // ─── User Positions (position tracker for /in command) ───────────────────────
 
 export interface UserPosition {

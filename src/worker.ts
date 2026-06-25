@@ -24,10 +24,12 @@ import {
   getActiveSignals,
   getUsersInPosition,
   closeUserPositions,
+  getSymbolPerformance,
 } from './db';
 import { getCandles } from './services/binance';
 import { analyzeCandles, analyzeRsiBounce, isNotifiableSignal } from './services/analysis';
 import { getFundingRate, getOpenInterestDelta, evaluatePerpConfluence } from './services/perp';
+import { checkNewsPause } from './services/news-pause';
 import { fetchCryptoPanicNews } from './services/cryptopanic';
 import { fetchAndAnalyzeMacroNews } from './services/news';
 import { AnalysisResult } from './types';
@@ -46,6 +48,49 @@ const INTERVAL_MS = (parseInt(process.env.WORKER_INTERVAL_MINUTES ?? '5', 10)) *
 // Quality filter: max concurrent open trades. Protects against multiple
 // correlated alt-positions all dumping together on a BTC move.
 const MAX_OPEN_TRADES = parseInt(process.env.MAX_OPEN_TRADES ?? '5', 10);
+
+// Auto-disable thresholds: a coin under this R-sum over PERF_WINDOW_DAYS
+// gets blocked for new entries. Refreshed every PERF_REFRESH_MS.
+const PERF_WINDOW_DAYS    = parseInt(process.env.PERF_WINDOW_DAYS    ?? '60', 10);
+const PERF_DISABLE_R_SUM  = parseFloat(process.env.PERF_DISABLE_R_SUM ?? '-3');
+const PERF_MIN_TRADES     = parseInt(process.env.PERF_MIN_TRADES     ?? '4', 10);
+const PERF_REFRESH_MS     = 6 * 60 * 60 * 1000; // re-evaluate every 6h
+
+const disabledSymbols  = new Set<string>();
+let   perfLastRefresh  = 0;
+
+async function refreshDisabledSymbols(): Promise<void> {
+  try {
+    const perf = await getSymbolPerformance(PERF_WINDOW_DAYS);
+    const newlyDisabled: string[] = [];
+    const reEnabled:     string[] = [];
+
+    for (const p of perf) {
+      const shouldDisable = p.trades >= PERF_MIN_TRADES && p.rSum <= PERF_DISABLE_R_SUM;
+      if (shouldDisable && !disabledSymbols.has(p.symbol)) {
+        disabledSymbols.add(p.symbol);
+        newlyDisabled.push(`${p.symbol} (${p.rSum.toFixed(1)}R/${p.trades}t)`);
+      } else if (!shouldDisable && disabledSymbols.has(p.symbol)) {
+        disabledSymbols.delete(p.symbol);
+        reEnabled.push(`${p.symbol} (${p.rSum.toFixed(1)}R/${p.trades}t)`);
+      }
+    }
+
+    perfLastRefresh = Date.now();
+    if (newlyDisabled.length || reEnabled.length) {
+      const msg = [
+        newlyDisabled.length ? `🚫 Disabled: ${newlyDisabled.join(', ')}` : '',
+        reEnabled.length     ? `✅ Re-enabled: ${reEnabled.join(', ')}`    : '',
+      ].filter(Boolean).join('\n');
+      console.log(`[perf] ${msg}`);
+      await notifyAdmin(`📊 *Per-Coin Performance Update*\n${msg}\n\nWindow: ${PERF_WINDOW_DAYS}d, threshold: ≤${PERF_DISABLE_R_SUM}R after ${PERF_MIN_TRADES}+ trades`);
+    } else {
+      console.log(`[perf] Refresh OK — ${disabledSymbols.size} symbols disabled`);
+    }
+  } catch (e) {
+    console.error('[perf] refresh failed:', (e as Error).message);
+  }
+}
 
 // ─── Channel config ───────────────────────────────────────────────────────────
 const CHANNEL_ID: string | null = process.env.CHANNEL_ID ?? null;
@@ -603,10 +648,41 @@ async function fireSignal(
 async function passesQualityFilters(symbol: string, result: AnalysisResult): Promise<boolean> {
   if (!result.direction) return false;
 
+  // 0. Auto-disable: refresh the disabled-symbols set every 6h, then block.
+  if (Date.now() - perfLastRefresh > PERF_REFRESH_MS) {
+    await refreshDisabledSymbols();
+  }
+  if (disabledSymbols.has(symbol)) {
+    console.log(`[filter] ${symbol}: BLOCKED — coin auto-disabled (< ${PERF_DISABLE_R_SUM}R over last ${PERF_WINDOW_DAYS}d)`);
+    return false;
+  }
+
   // 1. Correlation cap — don't open more than N positions at once.
   if (activeTrades.size >= MAX_OPEN_TRADES) {
     console.log(`[filter] ${symbol}: BLOCKED — ${activeTrades.size}/${MAX_OPEN_TRADES} open trades, correlation cap hit`);
     return false;
+  }
+
+  // 1b. News-pause: don't enter during ±2h around FOMC / CPI / NFP / rate decisions.
+  const newsStatus = await checkNewsPause();
+  if (newsStatus.paused) {
+    console.log(`[filter] ${symbol}: BLOCKED — news pause: ${newsStatus.reason}`);
+    return false;
+  }
+
+  // 1c. Session confluence (Phase 3 lite): not a block, just a confluence point.
+  //     US session 13–21 UTC has historically the highest follow-through for crypto.
+  const utcHour = new Date().getUTCHours();
+  const isUsSession  = utcHour >= 13 && utcHour < 21;
+  const isAsiaOnly   = utcHour >= 0  && utcHour < 6;
+  if (isUsSession) {
+    const reason = 'US-Session (13–21 UTC) — höchste Follow-Through-Rate ✅';
+    result.signals.push(reason);
+    if (result.confluenceBreakdown) result.confluenceBreakdown.push(reason);
+  } else if (isAsiaOnly) {
+    const reason = '⚠️ Asia-only Session (0–6 UTC) — typischerweise choppier';
+    result.signals.push(reason);
+    if (result.confluenceBreakdown) result.confluenceBreakdown.push(reason);
   }
 
   // 2. Perp confluence — funding rate + open-interest delta. Best-effort:
@@ -998,7 +1074,14 @@ async function main(): Promise<void> {
   }
 
   await restoreActiveTrades();
-  await notifyAdmin('Worker gestartet!\nIntervall: ' + INTERVAL_MS / 60000 + ' min\nEMA Cross: ' + CHANNEL_SYMBOLS.length + ' Coins\nRSI Bounce: ' + RSI_BOUNCE_SYMBOLS.length + ' Coins\n' + new Date().toISOString());
+  await refreshDisabledSymbols(); // initial per-coin performance load
+  await notifyAdmin(
+    'Worker gestartet!\nIntervall: ' + INTERVAL_MS / 60000 + ' min\n' +
+    'EMA Cross: ' + CHANNEL_SYMBOLS.length + ' Coins\n' +
+    'RSI Bounce: ' + RSI_BOUNCE_SYMBOLS.length + ' Coins\n' +
+    'Auto-disabled: ' + (disabledSymbols.size > 0 ? Array.from(disabledSymbols).join(', ') : 'none') + '\n' +
+    new Date().toISOString(),
+  );
   setInterval(tick, INTERVAL_MS);
   await tick();
 }
